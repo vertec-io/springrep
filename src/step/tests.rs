@@ -3685,3 +3685,217 @@ fn a_face_on_the_far_nappe_of_its_cone_is_read_and_cut() {
         }
     }
 }
+
+/// The octant x, y, z ≥ 0 of a ball of radius 10 at the origin: three quarter discs and an
+/// eighth of the sphere, bounded by three quarter circles, its sphere framed by `axis` and `ref`.
+fn octant(axis: [f64; 3], reference: [f64; 3]) -> String {
+    let d = |v: [f64; 3]| format!("({:?},{:?},{:?})", v[0], v[1], v[2]);
+    step_file(&format!(
+        "#1=CARTESIAN_POINT('',(0.,0.,0.));
+#2=DIRECTION('',(1.,0.,0.));
+#3=DIRECTION('',(0.,1.,0.));
+#4=DIRECTION('',(0.,0.,1.));
+#5=DIRECTION('',(-1.,0.,0.));
+#6=DIRECTION('',(0.,-1.,0.));
+#7=DIRECTION('',(0.,0.,-1.));
+#10=VERTEX_POINT('',#1);
+#11=CARTESIAN_POINT('',(10.,0.,0.));
+#12=VERTEX_POINT('',#11);
+#13=CARTESIAN_POINT('',(0.,10.,0.));
+#14=VERTEX_POINT('',#13);
+#15=CARTESIAN_POINT('',(0.,0.,10.));
+#16=VERTEX_POINT('',#15);
+#20=LINE('',#1,#25);
+#21=LINE('',#1,#26);
+#22=LINE('',#1,#27);
+#25=VECTOR('',#2,1.);
+#26=VECTOR('',#3,1.);
+#27=VECTOR('',#4,1.);
+#30=EDGE_CURVE('',#10,#12,#20,.T.);
+#31=EDGE_CURVE('',#10,#14,#21,.T.);
+#32=EDGE_CURVE('',#10,#16,#22,.T.);
+#33=AXIS2_PLACEMENT_3D('',#1,#4,#2);
+#34=AXIS2_PLACEMENT_3D('',#1,#2,#3);
+#35=AXIS2_PLACEMENT_3D('',#1,#3,#4);
+#36=CIRCLE('',#33,10.);
+#37=CIRCLE('',#34,10.);
+#38=CIRCLE('',#35,10.);
+#40=EDGE_CURVE('',#12,#14,#36,.T.);
+#41=EDGE_CURVE('',#14,#16,#37,.T.);
+#42=EDGE_CURVE('',#16,#12,#38,.T.);
+#50=ORIENTED_EDGE('',*,*,#31,.T.);
+#51=ORIENTED_EDGE('',*,*,#40,.F.);
+#52=ORIENTED_EDGE('',*,*,#30,.F.);
+#53=EDGE_LOOP('',(#50,#51,#52));
+#54=FACE_OUTER_BOUND('',#53,.T.);
+#55=AXIS2_PLACEMENT_3D('',#1,#7,#2);
+#56=PLANE('',#55);
+#57=ADVANCED_FACE('',(#54),#56,.T.);
+#60=ORIENTED_EDGE('',*,*,#32,.T.);
+#61=ORIENTED_EDGE('',*,*,#41,.F.);
+#62=ORIENTED_EDGE('',*,*,#31,.F.);
+#63=EDGE_LOOP('',(#60,#61,#62));
+#64=FACE_OUTER_BOUND('',#63,.T.);
+#65=AXIS2_PLACEMENT_3D('',#1,#5,#3);
+#66=PLANE('',#65);
+#67=ADVANCED_FACE('',(#64),#66,.T.);
+#70=ORIENTED_EDGE('',*,*,#30,.T.);
+#71=ORIENTED_EDGE('',*,*,#42,.F.);
+#72=ORIENTED_EDGE('',*,*,#32,.F.);
+#73=EDGE_LOOP('',(#70,#71,#72));
+#74=FACE_OUTER_BOUND('',#73,.T.);
+#75=AXIS2_PLACEMENT_3D('',#1,#6,#4);
+#76=PLANE('',#75);
+#77=ADVANCED_FACE('',(#74),#76,.T.);
+#80=ORIENTED_EDGE('',*,*,#40,.T.);
+#81=ORIENTED_EDGE('',*,*,#41,.T.);
+#82=ORIENTED_EDGE('',*,*,#42,.T.);
+#83=EDGE_LOOP('',(#80,#81,#82));
+#84=FACE_OUTER_BOUND('',#83,.T.);
+#85=DIRECTION('',{});
+#86=DIRECTION('',{});
+#87=AXIS2_PLACEMENT_3D('',#1,#85,#86);
+#88=SPHERICAL_SURFACE('',#87,10.);
+#89=ADVANCED_FACE('',(#84),#88,.T.);
+#90=CLOSED_SHELL('',(#57,#67,#77,#89));
+#91=MANIFOLD_SOLID_BREP('',#90);",
+        d(axis),
+        d(reference)
+    ))
+}
+#[test]
+fn a_sphere_face_whose_edge_passes_through_a_pole_is_split_there() {
+    // An eighth of a ball of radius 10: volume π·10³/6, area three quarter discs and an eighth of
+    // the sphere, 3π·10²/4 + π·10²/2. The sphere is framed so that a pole lies in the middle of a
+    // quarter circle bounding it (the first three), at a corner, or inside the face. Six edges
+    // with curves bound the octant; one through a pole is split there, and a pole inside the face
+    // is reached by a seam: seven.
+    let h = std::f64::consts::FRAC_1_SQRT_2;
+    let (volume, area) = (1000.0 * PI / 6.0, 125.0 * PI);
+    let cases = [
+        ([h, 0.0, h], [h, 0.0, -h], 1),
+        ([-h, 0.0, -h], [h, 0.0, -h], 1),
+        ([h, h, 0.0], [0.0, 0.0, 1.0], 1),
+        ([0.0, 0.0, 1.0], [1.0, 0.0, 0.0], 0),
+        ([1.0, 1.0, 1.0], [1.0, -1.0, 0.0], 1),
+    ];
+    for (axis, reference, more) in cases {
+        let imp = read(octant(axis, reference).as_bytes(), "imp").unwrap();
+        assert!(imp.rejected.is_empty(), "{axis:?}: {:?}", imp.rejected);
+        let b = imp.brep;
+        assert!(
+            check::check(&b).is_empty(),
+            "{axis:?}: {:?}",
+            check::check(&b)
+        );
+        let (v, a) = (measure::volume(&b), measure::area(&b));
+        assert!((v - volume).abs() < 1e-9 * volume, "{axis:?}: volume {v}");
+        assert!((a - area).abs() < 1e-9 * area, "{axis:?}: area {a}");
+        let edges = b.edge_ids().filter(|&e| b.edge(e).curve.is_some()).count();
+        assert_eq!(edges, 6 + more, "{axis:?}");
+        round_trip(&b);
+    }
+}
+
+/// Reads a parameter-plane reproducer of `tests/fixtures/track-loop` and checks it is one sound
+/// solid of `volume`, written back and read again as it was.
+fn reads_whole(name: &str, text: &[u8], volume: f64) {
+    let imp = read(text, "imp").unwrap();
+    assert!(imp.rejected.is_empty(), "{name}: {:?}", imp.rejected);
+    let b = imp.brep;
+    assert!(
+        check::check(&b).is_empty(),
+        "{name}: {:?}",
+        check::check(&b)
+    );
+    let v = measure::volume(&b);
+    assert!(
+        (v - volume).abs() < 1e-9 * volume,
+        "{name}: volume {v}, not {volume}"
+    );
+    round_trip(&b);
+}
+
+#[test]
+fn a_spline_face_that_stands_still_along_an_end_line_is_no_pole() {
+    // A prism of height 4 over the region bounded by O A = (10, 0) and a cubic Bezier from A to
+    // B = (5, 10) back to O, its spline side cubic along u, linear along v. Where two end control
+    // points of the cubic coincide, the side's u derivative vanishes along its whole end line, a
+    // line in space all the same; the side's parameters are also written running each way round.
+    // Volumes by Green's theorem on the polynomial boundary, exact.
+    let cases: [(&str, &[u8], f64); 6] = [
+        (
+            "end",
+            include_bytes!("../../tests/fixtures/track-loop/spline_side_stationary_end.step"),
+            230.0,
+        ),
+        (
+            "end, u reversed",
+            include_bytes!("../../tests/fixtures/track-loop/spline_side_stationary_end_u.step"),
+            230.0,
+        ),
+        (
+            "end, v reversed",
+            include_bytes!("../../tests/fixtures/track-loop/spline_side_stationary_end_v.step"),
+            230.0,
+        ),
+        (
+            "end, both reversed",
+            include_bytes!("../../tests/fixtures/track-loop/spline_side_stationary_end_uv.step"),
+            230.0,
+        ),
+        (
+            "start",
+            include_bytes!("../../tests/fixtures/track-loop/spline_side_stationary_start.step"),
+            248.0,
+        ),
+        (
+            "regular",
+            include_bytes!("../../tests/fixtures/track-loop/spline_side_regular.step"),
+            251.0,
+        ),
+    ];
+    for (name, text, volume) in cases {
+        reads_whole(name, text, volume);
+    }
+}
+
+#[test]
+fn a_band_on_a_surface_of_revolution_gets_a_seam() {
+    // A tube between z = 0 and 10 about the z axis, its inner wall a cylinder of radius 6, its
+    // outer one the revolution of the cubic Bezier r = 10, 13, 13, 10 (z = 10 t), bounded by its
+    // two rim circles and no seam. Volume pi (int r^2 dz - 360) = 967 pi; with two windows of a
+    // twelfth of a turn each through the wall between z = 3 and 7, less (pi / 12) int (r^2 - 36) dz
+    // over them each: 66967579 pi / 75000. The windowed band has its rims as two outer bounds and
+    // the windows as two inner ones, as one exporter writes it.
+    let cases: [(&str, &[u8], f64); 5] = [
+        (
+            "band",
+            include_bytes!("../../tests/fixtures/track-loop/revolution_band.step"),
+            967.0 * PI,
+        ),
+        (
+            "two outer",
+            include_bytes!("../../tests/fixtures/track-loop/revolution_band_two_outer.step"),
+            967.0 * PI,
+        ),
+        (
+            "apart",
+            include_bytes!("../../tests/fixtures/track-loop/revolution_band_apart.step"),
+            967.0 * PI,
+        ),
+        (
+            "windows",
+            include_bytes!("../../tests/fixtures/track-loop/revolution_band_windows.step"),
+            66967579.0 * PI / 75000.0,
+        ),
+        (
+            "cylinder",
+            include_bytes!("../../tests/fixtures/track-loop/cylinder_band_windows.step"),
+            1792.0 * PI / 3.0,
+        ),
+    ];
+    for (name, text, volume) in cases {
+        reads_whole(name, text, volume);
+    }
+}

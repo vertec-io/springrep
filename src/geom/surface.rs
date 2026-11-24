@@ -245,6 +245,39 @@ impl Surface {
         }
     }
 
+    /// Whether the line of `u` (of `v`, `along_v`) through `uv` is a single point, as at a pole. A
+    /// vanishing derivative alone is not one: a spline whose end control points coincide stands still
+    /// along its end line, which is still a curve, and the loop runs along it as along any other.
+    /// The line is sampled across its parameter's period or domain, a pole's points all within the
+    /// tolerance of each other.
+    pub(crate) fn line_is_point(&self, uv: Vec2, along_v: bool) -> bool {
+        let s = self;
+        let (period, domain) = match (along_v, s) {
+            (false, Surface::Nurbs(n)) => (s.u_period(), Some(n.domain().0)),
+            (true, Surface::Nurbs(n)) => (s.v_period(), Some(n.domain().1)),
+            (false, _) => (s.u_period(), None),
+            (true, _) => (s.v_period(), None),
+        };
+        let at = |x: f64| {
+            if along_v {
+                s.eval(uv.x, x)
+            } else {
+                s.eval(x, uv.y)
+            }
+        };
+        let here = s.eval(uv.x, uv.y);
+        let own = if along_v { uv.y } else { uv.x };
+        let samples: Vec<f64> = match (period, domain) {
+            (Some(p), _) => (1..8).map(|k| own + p * k as f64 / 8.0).collect(),
+            (None, Some((lo, hi))) => (0..=8).map(|k| lo + (hi - lo) * k as f64 / 8.0).collect(),
+            // No known extent: a step either way, far beyond where a stationary point stays put.
+            (None, None) => [-1e-2, 1e-2].map(|d| own + d * (1.0 + own.abs())).to_vec(),
+        };
+        samples
+            .into_iter()
+            .all(|x| at(x).dist(here) <= 2.0 * tol::LINEAR)
+    }
+
     pub fn u_period(&self) -> Option<f64> {
         match self {
             Surface::Cylinder(_)

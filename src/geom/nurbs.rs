@@ -2174,7 +2174,7 @@ impl NurbsSurface {
         uv = inside;
         // At a pole one parameter moves nothing, and no step solved there says which of the lines
         // out of it leads to the foot: the line is chosen first, and the search starts down it.
-        if let Some(free) = pole_of(&at) {
+        if let Some(free) = self.pole_at(uv, &at) {
             match self.off_pole(p, uv, free) {
                 Some(off) => {
                     uv = off;
@@ -2212,7 +2212,7 @@ impl NurbsSurface {
                     .flatten()
                     .or_else(|| solve2(a, b, b, d, -g0, -g1))
                     .or_else(|| {
-                        (pole_of(&at).is_none())
+                        (self.pole_at(uv, &at).is_none())
                             .then(|| eigen_step(ha, hb, hd, g0, g1))
                             .flatten()
                     }),
@@ -2228,7 +2228,7 @@ impl NurbsSurface {
             if (su * du + sv * dv).norm() <= 1e-6 * tol::LINEAR {
                 let size = 1.0 + (u1 - u0) + (v1 - v0);
                 uv = clamp(Vec2::new(uv.x + du, uv.y + dv));
-                if du.abs() + dv.abs() <= 1e-12 * size || pole_of(&at).is_some() {
+                if du.abs() + dv.abs() <= 1e-12 * size || self.pole_at(uv, &at).is_some() {
                     return (self.wrapped(uv), self.eval(uv.x, uv.y).dist(p), true);
                 }
                 at = self.d2(uv.x, uv.y);
@@ -2364,6 +2364,25 @@ impl NurbsSurface {
         Some(at(t, w))
     }
 
+    /// [`pole_of`] at `uv`, where the line of the parameter that moves nothing is one point: a
+    /// vanishing derivative alone, along an end line whose control points coincide, is a line on
+    /// which the surface stands still, not a pole, and no line out of it need be chosen.
+    fn pole_at(&self, uv: Vec2, at: &[Vec3; 6]) -> Option<usize> {
+        let free = pole_of(at)?;
+        let ((u0, u1), (v0, v1)) = self.domain();
+        let (lo, hi) = if free == 0 { (u0, u1) } else { (v0, v1) };
+        let point = (0..=8).all(|k| {
+            let x = lo + (hi - lo) * k as f64 / 8.0;
+            let q = if free == 0 {
+                self.eval(x, uv.y)
+            } else {
+                self.eval(uv.x, x)
+            };
+            q.dist(at[0]) <= 2.0 * tol::LINEAR
+        });
+        point.then_some(free)
+    }
+
     fn wrapped(&self, uv: Vec2) -> Vec2 {
         Vec2::new(
             self.bu.wrap(uv.x, self.u_period),
@@ -2407,8 +2426,7 @@ impl NurbsSurface {
         // A hint on a pole says nothing of the free parameter: Newton from it finds the point
         // nearest along that one line out of the pole, which can be a boundary's, not the patch's.
         let at = self.d2(hint.x, hint.y);
-        let [_, su, sv, ..] = at;
-        if su.norm().min(sv.norm()) <= 1e-9 * su.norm().max(sv.norm()) {
+        if self.pole_at(hint, &at).is_some() {
             return self.project(p);
         }
         let (local, d, settled) = self.search(p, hint, Some(at));

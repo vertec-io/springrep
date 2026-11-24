@@ -14,7 +14,7 @@ use super::part21::Param;
 use crate::{
     Error, Result, check,
     geom::{Circle, Cone, Curve, Line, Surface},
-    math::{Frame, Point3, Vec2},
+    math::{Frame, Point3, Transform, Vec2},
     tol,
     topo::{Brep, CoedgeSpec, EdgeId, FaceId, PCurve, ShellId, SolidId, VertexId, project_on},
 };
@@ -756,23 +756,37 @@ impl<'g, 'a> Reader<'g, 'a> {
         Some(())
     }
 
-    /// A spline face closed round one of its parameters with two loops that each go once round
-    /// it, the ways opposite, and no seam: [`Reader::seamed_band`] with that parameter for the
-    /// angle, and the surface's own iso curve for the seam. `None` when the face is not such a
-    /// band.
-    fn seamed_spline_band(
+    /// A face closed round one of its surface's parameters, and not round the other, with two
+    /// loops that each go once round it, the ways opposite, and no seam: [`Reader::seamed_band`]
+    /// with that parameter for the angle, and the surface's own line of the other parameter for
+    /// the seam: a spline's iso curve, a surface of revolution's profile turned to that angle, an
+    /// extrusion's generator. `None` when the face is not such a band.
+    fn seamed_parameter_band(
         &mut self,
         id: u64,
         surface: &Surface,
         bounds: &mut Vec<(bool, Vec<Use>)>,
     ) -> Option<()> {
-        let Surface::Nurbs(n) = surface else {
-            return None;
-        };
         let (in_v, period) = match (surface.u_period(), surface.v_period()) {
             (None, Some(p)) => (true, p),
             (Some(p), None) => (false, p),
             _ => return None,
+        };
+        // The line of the other parameter at `at` of the closed one: the curve whose own parameter
+        // is the surface's there.
+        let line_at = |at: f64| -> Option<Curve> {
+            match (surface, in_v) {
+                (Surface::Nurbs(n), _) => Some(Curve::Nurbs(Box::new(n.iso_curve(!in_v, at)))),
+                (Surface::Revolution(r), false) => Some(
+                    r.curve
+                        .transformed(&Transform::rotation(r.origin, r.axis, at)),
+                ),
+                (Surface::Extrusion(x), false) => Some(Curve::Line(Line {
+                    origin: x.curve.eval(at),
+                    dir: x.dir.unit()?,
+                })),
+                _ => None,
+            }
         };
         const TAU: f64 = std::f64::consts::TAU;
         let angle = |p: Point3| {
@@ -811,7 +825,7 @@ impl<'g, 'a> Reader<'g, 'a> {
             })
             .max_by(|x, y| x.0.total_cmp(&y.0))?
             .1;
-        let seam = Curve::Nurbs(Box::new(n.iso_curve(!in_v, at / TAU * period)));
+        let seam = line_at(at / TAU * period)?;
         let on_seam = |raw: &Raw, u: &Use| {
             let q = raw.points[use_start(raw, u)];
             seam.eval(param_of(&seam, q)).dist(q) <= tol::LINEAR
@@ -933,6 +947,45 @@ impl<'g, 'a> Reader<'g, 'a> {
         Ok(true)
     }
 
+    /// Splits each edge of `bounds` that passes through a pole of `surface` between its vertices
+    /// at that pole. A pole is a whole line of the parameter plane, so a loop through one leaves it
+    /// at another value of the free parameter than it arrived with (a meridian over a sphere's
+    /// pole turns by half a turn there): only at a vertex can the loop's parameters jump, along the
+    /// pole's own line, as a degenerate edge does, and only a vertex there gives it one.
+    fn split_at_poles(&mut self, surface: &Surface, bounds: &mut [(bool, Vec<Use>)]) {
+        for pole in poles(surface) {
+            loop {
+                let mut found = None;
+                'search: for (_, uses) in bounds.iter() {
+                    for u in uses {
+                        let e = &self.raw.edges[u.edge];
+                        let (ps, pe) = (self.raw.points[e.start], self.raw.points[e.end]);
+                        if ps.dist(pole) <= tol::LINEAR || pe.dist(pole) <= tol::LINEAR {
+                            continue;
+                        }
+                        let Some((t0, t1)) = edge_range(&e.curve, ps, pe, e.start == e.end) else {
+                            continue;
+                        };
+                        let t = param_of(&e.curve, pole);
+                        let shifts = match e.curve.period() {
+                            Some(p) => [0.0, p, -p],
+                            None => [0.0; 3],
+                        };
+                        for d in shifts {
+                            let t = t + d;
+                            if t > t0 && t < t1 && e.curve.eval(t).dist(pole) <= tol::LINEAR {
+                                found = Some((u.edge, t));
+                                break 'search;
+                            }
+                        }
+                    }
+                }
+                let Some((e, t)) = found else { break };
+                self.split_edge(e, t, bounds);
+            }
+        }
+    }
+
     fn face(&mut self, id: u64, flip_face: bool) -> Result<usize> {
         let (_, a) = self.params(id, &["ADVANCED_FACE", "FACE_SURFACE"])?;
         let name = a.first().and_then(Param::as_str).unwrap_or("").to_string();
@@ -1027,11 +1080,14 @@ impl<'g, 'a> Reader<'g, 'a> {
         if self
             .seamed_band(id, &surface, reversed, &mut bounds)
             .is_none()
-            && self.seamed_spline_band(id, &surface, &mut bounds).is_none()
+            && self
+                .seamed_parameter_band(id, &surface, &mut bounds)
+                .is_none()
             && apexes.is_empty()
         {
             self.capped(id, &mut surface, reversed, &mut bounds)?;
         }
+        self.split_at_poles(&surface, &mut bounds);
         let f = self.raw.faces.len();
         for (_, uses) in &bounds {
             for u in uses {
@@ -1372,7 +1428,52 @@ fn coincides_with_twin(uses: &[Use], acc: &[Track], k: usize, uvs: &[Vec2]) -> b
 /// does not move the point.
 fn pole_free(s: &Surface, uv: Vec2) -> (bool, bool) {
     let (_, su, sv) = s.d1(uv.x, uv.y);
-    (su.norm() <= tol::LINEAR, sv.norm() <= tol::LINEAR)
+    (
+        su.norm() <= tol::LINEAR && s.line_is_point(uv, false),
+        sv.norm() <= tol::LINEAR && s.line_is_point(uv, true),
+    )
+}
+
+/// The points of `s` where a whole line of its parameter plane meets: a sphere's poles, a cone's
+/// apex, the ends of a revolved profile on its axis, a spline's boundary line that is one point.
+fn poles(s: &Surface) -> Vec<Point3> {
+    match s {
+        Surface::Sphere(sp) => {
+            let (o, z) = (sp.frame.origin, sp.frame.z);
+            vec![o + z * sp.radius, o - z * sp.radius]
+        }
+        Surface::Cone(c) if c.half_angle.tan().abs() > tol::ANGULAR => {
+            vec![c.frame.origin - c.frame.z * (c.radius / c.half_angle.tan())]
+        }
+        Surface::Revolution(r) => {
+            let (d0, d1) = r.curve.domain();
+            [d0, d1]
+                .into_iter()
+                .filter(|t| t.is_finite())
+                .map(|t| r.curve.eval(t))
+                .filter(|&q| {
+                    let w = q - r.origin;
+                    (w - r.axis * w.dot(r.axis)).norm() <= tol::LINEAR
+                })
+                .collect()
+        }
+        Surface::Nurbs(n) => {
+            let ((u0, u1), (v0, v1)) = n.domain();
+            let mut out = Vec::new();
+            for (uv, along_v) in [
+                (Vec2::new(u0, v0), false),
+                (Vec2::new(u0, v1), false),
+                (Vec2::new(u0, v0), true),
+                (Vec2::new(u1, v0), true),
+            ] {
+                if s.line_is_point(uv, along_v) {
+                    out.push(s.eval(uv.x, uv.y));
+                }
+            }
+            out
+        }
+        _ => Vec::new(),
+    }
 }
 
 /// Whether `a` and `b` are the same point of the parameter plane, not a period apart.

@@ -263,3 +263,62 @@ fn a_lofted_cylinder_cut_on_a_slant_measures_its_closed_form_every_way() {
     let got = measure::area(&b);
     assert!((got - area).abs() <= 1e-9 * area, "area {got} vs {area}");
 }
+
+/// An assembly measured face by face over the machine's threads: sixteen prisms 7 apart along x,
+/// each 5 tall on the regular 48-gon of circumradius 3 drawn as a closed spline of degree one,
+/// whose edges' 48 spans each are pieces of the boundary integrals, several thousand in all.
+///
+/// The 48-gon is 48 triangles from its centre, each `½R² sin θ` with `θ = 2π/48`, so its area is
+/// `A = 24R² sin θ` and its outline `96R sin(θ/2)`. A triangle from the origin to `a` and `b`
+/// has `∫|r|² = (Aₜ/6)(|a|² + a·b + |b|²)`, so the 48-gon's polar moment is `A R²(2 + cos θ)/6`,
+/// half of it about each axis in its plane by symmetry, and a prism's moments about its centre
+/// are those times its height, plus `V h²/12` about the axes across it.
+#[test]
+fn an_assembly_of_spline_prisms_has_the_sums_of_its_prisms_closed_forms() {
+    let (n, r, h, pitch, k) = (48usize, 3.0, 5.0, 7.0, 16usize);
+    let theta = TAU / n as f64;
+    let mut arena = Brep::new();
+    for i in 0..k {
+        let corners: Vec<Vec3> = (0..n)
+            .map(|j| {
+                let t = theta * j as f64;
+                Vec3::new(r * t.cos(), r * t.sin(), 0.0)
+            })
+            .collect();
+        let curve = springrep::geom::BSpline::periodic_uniform(1, &corners).unwrap();
+        let side = Segment::Spline {
+            curve,
+            reversed: false,
+        };
+        let outline = Profile::outline(vec![seg(side, "side")]);
+        let at = Frame::new(Vec3::new(pitch * i as f64, 0.0, 0.0), Vec3::Z, Vec3::X).unwrap();
+        arena.append(&extrude(&outline, &at, h, "prism").unwrap());
+    }
+    let section = 0.5 * n as f64 * r * r * theta.sin();
+    let outline = 2.0 * n as f64 * r * (0.5 * theta).sin();
+    let (volume, skin) = (
+        k as f64 * section * h,
+        k as f64 * (2.0 * section + outline * h),
+    );
+
+    let (a, v) = measure::area_and_volume(&arena);
+    assert!(
+        (v - volume).abs() <= 1e-12 * volume,
+        "volume {v} vs {volume}"
+    );
+    assert!((a - skin).abs() <= 1e-12 * skin, "area {a} vs {skin}");
+    let (a, v) = (measure::area(&arena), measure::volume(&arena));
+    assert!(
+        (v - volume).abs() <= 1e-12 * volume,
+        "volume {v} vs {volume}"
+    );
+    assert!((a - skin).abs() <= 1e-12 * skin, "area {a} vs {skin}");
+
+    let one = section * h;
+    let mid = pitch * (k - 1) as f64 / 2.0;
+    let spread: f64 = (0..k).map(|i| (pitch * i as f64 - mid).powi(2)).sum();
+    let across = k as f64 * one * (r * r * (2.0 + theta.cos()) / 12.0 + h * h / 12.0);
+    let about_axis = k as f64 * one * r * r * (2.0 + theta.cos()) / 6.0;
+    let inertia = diagonal([across, across + one * spread, about_axis + one * spread]);
+    assert_mass(&arena, volume, [mid, 0.0, h / 2.0], inertia);
+}

@@ -17,13 +17,17 @@ pub use sample::{
 pub use section::{SectionEdge, section, section_area, section_curves};
 pub use slice::{SliceCurve, slice, slices};
 
-use std::f64::consts::TAU;
+use std::{
+    f64::consts::TAU,
+    sync::atomic::{AtomicUsize, Ordering},
+};
 
 use crate::{
     check::coedge_params,
     geom::{IsoLine, NurbsSurface, Patch, Surface},
     math::{Aabb, Point3, Vec2, Vec3},
     numeric::{KRONROD_7, KRONROD_15, gauss, solve2},
+    threads,
     topo::{
         Brep, CoedgeId, FaceId, FaceVolume, IntegralKey, LoopId, PCurve, SolidId, VertexId,
         pcurve::{spline_rate, spline_uv},
@@ -750,8 +754,76 @@ pub fn face_area(b: &Brep, f: FaceId) -> f64 {
 /// The area of every face in the arena.
 pub fn area(b: &Brep) -> f64 {
     let (c, scale) = moment_reference(b);
-    b.face_ids().map(|f| face_exact(b, f, c, scale).0).sum()
+    let faces: Vec<FaceId> = b.face_ids().collect();
+    each_face(b, &faces, |f| face_exact(b, f, c, scale).0)
+        .into_iter()
+        .sum()
 }
+
+/// `work` on each of `faces`, in their order, spread over the machine's threads where there is
+/// enough of it to pay for them, heaviest first so that no long face starts last.
+///
+/// Each face's integrals are its own and are summed in the caller's order, so the totals are the
+/// same to the last bit on any number of threads. A face's cost is about its boundary integral's
+/// smooth pieces, one per span of each edge's curve: an assembly's few fitted sheets can hold
+/// tens of thousands of them, and its hundreds of planes and cylinders a handful each.
+fn each_face<T: Send>(b: &Brep, faces: &[FaceId], work: impl Fn(FaceId) -> T + Sync) -> Vec<T> {
+    let order: Vec<(usize, usize)> = faces
+        .iter()
+        .enumerate()
+        .map(|(k, &f)| (pieces(b, f), k))
+        .collect();
+    // A small solid is measured on the calling thread alone: its few pieces take less time
+    // than starting threads would.
+    let most = (order.iter().map(|w| w.0).sum::<usize>() / PIECES_PER_THREAD).min(faces.len());
+    each_face_on(most, faces, order, work)
+}
+
+/// How many smooth pieces face `f`'s boundary integrals take at the least: one per span of each
+/// of its edges' curves.
+fn pieces(b: &Brep, f: FaceId) -> usize {
+    b.face(f)
+        .loops
+        .iter()
+        .flat_map(|&lp| &b.lp(lp).coedges)
+        .map(|&co| {
+            let edge = b.edge(b.coedge(co).edge);
+            let (t0, t1) = edge.range;
+            1 + edge
+                .curve
+                .as_ref()
+                .map_or(0, |c| c.breakpoints(t0, t1).len())
+        })
+        .sum()
+}
+
+/// [`each_face`] on at most `most` threads, `order` each face's weight and place in `faces`.
+fn each_face_on<T: Send>(
+    most: usize,
+    faces: &[FaceId],
+    mut order: Vec<(usize, usize)>,
+    work: impl Fn(FaceId) -> T + Sync,
+) -> Vec<T> {
+    if most <= 1 {
+        return faces.iter().map(|&f| work(f)).collect();
+    }
+    order.sort_by(|a, b| b.0.cmp(&a.0).then(a.1.cmp(&b.1)));
+    let next = AtomicUsize::new(0);
+    let runs = threads::spread(most, || {
+        let mut mine = Vec::new();
+        while let Some(&(_, k)) = order.get(next.fetch_add(1, Ordering::Relaxed)) {
+            mine.push((k, work(faces[k])));
+        }
+        mine
+    });
+    let mut done: Vec<(usize, T)> = runs.into_iter().flatten().collect();
+    done.sort_by_key(|d| d.0);
+    done.into_iter().map(|d| d.1).collect()
+}
+
+/// How many smooth boundary pieces, summed over an arena's faces, are worth a thread of their own
+/// in [`each_face`].
+const PIECES_PER_THREAD: usize = 512;
 
 /// The boundary integrals' tolerance relative to the model's size: area to `EXACT·size²`, volume
 /// to `EXACT·size³`.
@@ -922,9 +994,9 @@ fn integrate_vec(g: &dyn Fn(f64) -> Vec3, a: f64, b: f64, tol: f64) -> Vec3 {
 /// The volume of every solid in the arena.
 pub fn volume(b: &Brep) -> f64 {
     let (c, scale) = moment_reference(b);
-    b.solid_ids()
-        .flat_map(|s| b.solid_faces(s))
-        .map(|f| face_exact(b, f, c, scale).1)
+    let faces: Vec<FaceId> = b.solid_ids().flat_map(|s| b.solid_faces(s)).collect();
+    each_face(b, &faces, |f| face_exact(b, f, c, scale).1)
+        .into_iter()
         .sum()
 }
 
@@ -937,7 +1009,8 @@ pub fn volume_to(b: &Brep, rel: f64) -> f64 {
 /// [`area`] and [`volume`] together, integrating each face once.
 pub fn area_and_volume(b: &Brep) -> (f64, f64) {
     let (c, scale) = moment_reference(b);
-    let per: Vec<(f64, f64)> = b.face_ids().map(|f| face_exact(b, f, c, scale)).collect();
+    let faces: Vec<FaceId> = b.face_ids().collect();
+    let per = each_face(b, &faces, |f| face_exact(b, f, c, scale));
     let area = per.iter().map(|x| x.0).sum();
     let volume = b
         .solid_ids()
@@ -965,13 +1038,11 @@ pub struct MassProperties {
 /// The mass properties of every solid in the arena together.
 pub fn mass_properties(b: &Brep) -> MassProperties {
     let (c, scale) = moment_reference(b);
+    let faces: Vec<FaceId> = b.solid_ids().flat_map(|s| b.solid_faces(s)).collect();
     let mut m = [0.0; 10];
-    for s in b.solid_ids() {
-        for f in b.solid_faces(s) {
-            let fm = face_moments(b, f, c, scale);
-            for i in 0..10 {
-                m[i] += fm[i];
-            }
+    for fm in each_face(b, &faces, |f| face_moments(b, f, c, scale)) {
+        for i in 0..10 {
+            m[i] += fm[i];
         }
     }
     from_moments(m, c)
@@ -2184,6 +2255,55 @@ mod tests {
         let (area, _) = face_integrals(&b, f, Point3::ZERO, 2.0, EXACT);
         let want = 2.0 * (13.0 * 13f64.sqrt() - 8.0) / 27.0;
         assert!((area - want).abs() < 1e-12, "{area} against {want}");
+    }
+
+    /// `k` prisms 5 tall side by side, each on the regular 48-gon of circumradius 3 drawn as a
+    /// closed spline of degree one, so each of its edges has 48 spans.
+    fn spline_prisms(k: usize) -> Brep {
+        let mut arena = Brep::new();
+        for i in 0..k {
+            let corners: Vec<Vec3> = (0..48)
+                .map(|j| {
+                    let t = TAU * j as f64 / 48.0;
+                    Vec3::new(3.0 * t.cos(), 3.0 * t.sin(), 0.0)
+                })
+                .collect();
+            let curve = crate::geom::BSpline::periodic_uniform(1, &corners).unwrap();
+            let side = Segment::Spline {
+                curve,
+                reversed: false,
+            };
+            let at = Frame::new(Vec3::new(7.0 * i as f64, 0.0, 0.0), Vec3::Z, Vec3::X).unwrap();
+            let outline = Profile::outline(vec![NamedSegment::new(side, "side")]);
+            arena.append(&extrude(&outline, &at, 5.0, "prism").unwrap());
+        }
+        arena
+    }
+
+    // Each face's integrals are its own and summed in the caller's order, so the faces measured
+    // on many threads, heaviest first, give the same values to the bit as one after another. Two
+    // arenas built alike keep the second from reading the first's memos.
+    #[test]
+    fn faces_measured_on_many_threads_match_those_measured_on_one_to_the_bit() {
+        let (one, many) = (spline_prisms(12), spline_prisms(12));
+        let faces: Vec<FaceId> = one.face_ids().collect();
+        assert_eq!(faces, many.face_ids().collect::<Vec<_>>());
+        let (c, scale) = moment_reference(&one);
+        let order: Vec<(usize, usize)> = faces
+            .iter()
+            .enumerate()
+            .map(|(k, &f)| (pieces(&one, f), k))
+            .collect();
+        // Enough pieces that the arena's own measures are spread too.
+        let total: usize = order.iter().map(|w| w.0).sum();
+        assert!(total >= 2 * PIECES_PER_THREAD, "{total} pieces");
+        let bits = |b: &Brep, most: usize| -> Vec<[u64; 2]> {
+            each_face_on(most, &faces, order.clone(), |f| {
+                let (a, v) = face_exact(b, f, c, scale);
+                [a.to_bits(), v.to_bits()]
+            })
+        };
+        assert_eq!(bits(&one, 1), bits(&many, 8));
     }
 
     #[test]

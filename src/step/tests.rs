@@ -4552,3 +4552,36 @@ fn healing_and_tolerances_of_a_void_read_as_a_solid_name_that_solid() {
         }
     }
 }
+
+#[test]
+fn touching_faces_a_tolerance_apart_meet_without_moving_surfaces() {
+    // Grown 1e-7, the round and the sides it is tangent to lie a tolerance apart: no point is
+    // within a quarter of it of all three faces at a corner, but the round's lines midway between
+    // its faces lie within half of it of both, and so do the corners midway between them. The
+    // solid closes at the kernel tolerance with no surface moved and no local tolerance.
+    let b = rounded_block();
+    let dr = 1e-7;
+    let imp = read(with_rounds_grown(&b, dr).as_bytes(), "imp").unwrap();
+    assert!(imp.rejected.is_empty(), "{:?}", imp.rejected);
+    assert!(check::check(&imp.brep).is_empty());
+    assert!(imp.tolerant.is_empty(), "{:?}", imp.tolerant);
+    assert_eq!(imp.healed.len(), 1);
+    let h = &imp.healed[0];
+    assert!(h.surfaces == 0.0 && h.moved <= 1.001 * dr, "{h:?}");
+    let (v0, v1) = (measure::volume(&b), measure::volume(&imp.brep));
+    assert!((v1 - v0).abs() <= measure::area(&b) * dr, "{v1} vs {v0}");
+}
+
+#[test]
+fn touching_faces_further_apart_than_the_file_states_are_kept_as_it_has_them() {
+    // Grown 5e-6 in a file that states 1e-6: closing the round would move a surface 2.5e-6, more
+    // than the file says its geometry is off, so the file's geometry is kept with tolerances of
+    // 1.5 times the 5e-6 gap, as it was before healing stopped at the first look.
+    let text = with_uncertainty(&with_rounds_grown(&rounded_block(), 5e-6), 1e-6);
+    let imp = read(text.as_bytes(), "imp").unwrap();
+    assert!(imp.rejected.is_empty(), "{:?}", imp.rejected);
+    assert!(check::check(&imp.brep).is_empty());
+    let t = &imp.tolerant[0];
+    assert_eq!((t.vertices, t.edges, t.past_stated), (4, 4, 8));
+    assert!((t.largest - 7.5e-6).abs() < 1e-8, "{t:?}");
+}

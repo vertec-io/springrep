@@ -68,6 +68,16 @@ pub(super) struct Raw {
     pub edges: Vec<RawEdge>,
     pub faces: Vec<RawFace>,
     pub shells: Vec<Vec<usize>>,
+    /// The uncertainty the file states, where it is above the kernel's: the most a vertex whose
+    /// faces touch there may hold its edges' ends apart ([`heal`]).
+    pub stated: Option<f64>,
+    /// The tolerance healing gave each vertex whose faces touch and have no common point: its
+    /// edges end on their own faces, within it of the vertex.
+    pub held: HashMap<usize, f64>,
+    /// The same for each edge whose faces touch along it and have no curve in common.
+    pub held_edges: HashMap<usize, f64>,
+    /// Whether the last heal found faces that touch and lie further apart than `stated`.
+    pub beyond: bool,
 }
 
 /// The parameter of the point of `c` nearest `p`; a periodic curve's within its first period.
@@ -2065,7 +2075,8 @@ fn shell_points(raw: &Raw, k: usize) -> Vec<Point3> {
 /// names and how far healing moved it; `uncertainty` is the one its file states, and `ours`
 /// whether this kernel wrote the file.
 fn built(raw: Raw, uncertainty: Option<f64>, ours: bool, strict: bool) -> Result<Shells> {
-    let file = own_nappes(join_contacts(raw))?;
+    let mut file = own_nappes(join_contacts(raw))?;
+    file.stated = uncertainty.filter(|&u| u > tol::LINEAR);
     let names = || file.faces.iter().map(|f| (f.id, f.name.clone())).collect();
     if strict {
         if let Some(why) = heal::misfit(&file) {
@@ -2180,6 +2191,12 @@ fn turned_round(raw: &Raw, turned: &[(SolidId, ShellId, bool)]) -> Raw {
 /// The arena of a solid read as `raw`, as the file orients it, unchecked.
 fn build(raw: &Raw, ranges: &[(f64, f64)], tolerated: Option<&heal::Tolerated>) -> Result<Brep> {
     let mut bld = Builder::new(raw, ranges);
+    for (&v, &x) in &raw.held {
+        bld.b.set_vertex_tolerance(bld.vertices[v], x);
+    }
+    for (&e, &x) in &raw.held_edges {
+        bld.b.set_edge_tolerance(bld.edges[e], x);
+    }
     if let Some(t) = tolerated {
         for (v, &x) in t.vertices.iter().enumerate() {
             bld.b.set_vertex_tolerance(bld.vertices[v], x);

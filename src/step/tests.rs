@@ -1336,6 +1336,86 @@ fn seamless_bands_of_revolution_are_given_a_seam() {
     }
 }
 
+/// A round bar about z from height 0 to 5, its side a straight line turned about the axis at
+/// radius `4 + d` and its two end circles, and the seam between them, written at radius 4: for
+/// `d ≠ 0` every edge and vertex misses the side by `d`.
+fn turned_bar(d: f64) -> String {
+    let x = 4.0 + d;
+    step_file(&format!(
+        "#1=CARTESIAN_POINT('',(0.,0.,0.));
+#2=DIRECTION('',(0.,0.,1.));
+#3=DIRECTION('',(1.,0.,0.));
+#4=AXIS2_PLACEMENT_3D('',#1,#2,#3);
+#5=DIRECTION('',(0.,0.,-1.));
+#6=AXIS1_PLACEMENT('',#1,#2);
+#10=AXIS2_PLACEMENT_3D('',#1,#5,#3);
+#11=PLANE('',#10);
+#12=CIRCLE('',#4,4.);
+#13=CARTESIAN_POINT('',(4.,0.,0.));
+#14=VERTEX_POINT('',#13);
+#15=EDGE_CURVE('',#14,#14,#12,.T.);
+#20=CARTESIAN_POINT('',(0.,0.,5.));
+#21=AXIS2_PLACEMENT_3D('',#20,#2,#3);
+#22=PLANE('',#21);
+#23=CIRCLE('',#21,4.);
+#24=CARTESIAN_POINT('',(4.,0.,5.));
+#25=VERTEX_POINT('',#24);
+#26=EDGE_CURVE('',#25,#25,#23,.T.);
+#30=CARTESIAN_POINT('',({x:?},0.,-1.));
+#31=CARTESIAN_POINT('',({x:?},0.,6.));
+#32=B_SPLINE_CURVE_WITH_KNOTS('',1,(#30,#31),.UNSPECIFIED.,.F.,.F.,(2,2),(0.,1.),.UNSPECIFIED.);
+#33=SURFACE_OF_REVOLUTION('',#32,#6);
+#34=VECTOR('',#2,1.);
+#35=LINE('',#13,#34);
+#36=EDGE_CURVE('',#14,#25,#35,.T.);
+#40=ORIENTED_EDGE('',*,*,#15,.F.);
+#41=EDGE_LOOP('',(#40));
+#42=FACE_OUTER_BOUND('',#41,.T.);
+#43=ADVANCED_FACE('',(#42),#11,.T.);
+#50=ORIENTED_EDGE('',*,*,#26,.T.);
+#51=EDGE_LOOP('',(#50));
+#52=FACE_OUTER_BOUND('',#51,.T.);
+#53=ADVANCED_FACE('',(#52),#22,.T.);
+#60=ORIENTED_EDGE('',*,*,#15,.T.);
+#61=ORIENTED_EDGE('',*,*,#36,.T.);
+#62=ORIENTED_EDGE('',*,*,#26,.F.);
+#63=ORIENTED_EDGE('',*,*,#36,.F.);
+#64=EDGE_LOOP('',(#60,#61,#62,#63));
+#65=FACE_OUTER_BOUND('',#64,.T.);
+#66=ADVANCED_FACE('',(#65),#33,.T.);
+#70=CLOSED_SHELL('',(#43,#53,#66));
+#71=MANIFOLD_SOLID_BREP('',#70);"
+    ))
+}
+
+#[test]
+fn edges_off_a_surface_of_revolution_are_refitted_onto_it() {
+    // Healing leaves the three faces where they are and brings the circles and the seam out onto
+    // the side: the bar of radius 4 + d and height 5, π(4 + d)²·5, every vertex moved by d.
+    for d in [0.0, 2e-5, -3e-5] {
+        let imp = read(turned_bar(d).as_bytes(), "imp").unwrap();
+        assert!(imp.rejected.is_empty(), "{d}: {:?}", imp.rejected);
+        assert!(check::check(&imp.brep).is_empty(), "{d}");
+        let want = PI * (4.0 + d) * (4.0 + d) * 5.0;
+        let got = measure::volume(&imp.brep);
+        assert!((got - want).abs() < 1e-9 * want, "{d}: {got} vs {want}");
+        if d == 0.0 {
+            assert!(
+                imp.healed.is_empty() && imp.tolerant.is_empty(),
+                "{:?}",
+                imp.healed
+            );
+        } else {
+            assert_eq!(imp.healed.len(), 1, "{d}: {:?}", imp.healed);
+            let h = &imp.healed[0];
+            assert!(
+                (h.moved - d.abs()).abs() <= 1e-9 && h.surfaces == 0.0,
+                "{d}: {h:?}"
+            );
+        }
+    }
+}
+
 /// The part `above` or below the plane at height `z` of a solid on `surface`, as a disc and one
 /// face bounded by the circle of radius √(25 − z²) there and no seam. `#4` frames along z at the
 /// origin, `#6` along x, and `#11` along z at the circle.

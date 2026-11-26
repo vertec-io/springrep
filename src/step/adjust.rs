@@ -390,9 +390,38 @@ fn control_groups(ctrl: &[Point3]) -> (Vec<usize>, usize) {
     (group_of, groups)
 }
 
+/// The rows of a sparse matrix, stored one after another: row `i` is
+/// `entries[start[i]..start[i + 1]]`, each entry a column and its value. Conjugate gradients read
+/// every row several times an iteration, and rows laid end to end are read in one sweep of memory.
+struct Rows {
+    start: Vec<usize>,
+    entries: Vec<(usize, f64)>,
+}
+
+impl Rows {
+    fn of(rows: &[Vec<(usize, f64)>]) -> Rows {
+        let mut start = Vec::with_capacity(rows.len() + 1);
+        let mut entries = Vec::with_capacity(rows.iter().map(Vec::len).sum());
+        start.push(0);
+        for row in rows {
+            entries.extend_from_slice(row);
+            start.push(entries.len());
+        }
+        Rows { start, entries }
+    }
+
+    fn len(&self) -> usize {
+        self.start.len() - 1
+    }
+
+    fn row(&self, i: usize) -> &[(usize, f64)] {
+        &self.entries[self.start[i]..self.start[i + 1]]
+    }
+}
+
 /// A sparse system `A x = b`, solved for the `x` of least weighted norm `Σ wⱼ xⱼ²`.
 struct System {
-    rows: Vec<Vec<(usize, f64)>>,
+    rows: Rows,
     rhs: Vec<f64>,
     inv_w: Vec<f64>,
     /// Consecutive rows that share a point's unknowns, as `start..end`.
@@ -411,17 +440,16 @@ impl System {
                 let k = b - a;
                 let mut m = vec![0.0; k * k];
                 for i in 0..k {
-                    for &(j, x) in &self.rows[a + i] {
+                    for &(j, x) in self.rows.row(a + i) {
                         dense[j] += x;
                     }
                     for l in 0..k {
-                        m[i * k + l] = self.rows[a + l]
-                            .iter()
+                        m[i * k + l] = (self.rows.row(a + l).iter())
                             .map(|&(j, x)| x * dense[j] * self.inv_w[j])
                             .sum::<f64>();
                     }
                     m[i * k + i] += lambda;
-                    for &(j, _) in &self.rows[a + i] {
+                    for &(j, _) in self.rows.row(a + i) {
                         dense[j] = 0.0;
                     }
                 }
@@ -440,46 +468,48 @@ impl System {
             .collect()
     }
 
+    /// `z = W⁻¹ Aᵀ y`.
+    fn at(&self, y: &[f64], z: &mut [f64]) {
+        z.fill(0.0);
+        for (i, &yi) in y.iter().enumerate() {
+            for &(j, a) in self.rows.row(i) {
+                z[j] += a * yi;
+            }
+        }
+        for (zj, w) in z.iter_mut().zip(&self.inv_w) {
+            *zj *= w;
+        }
+    }
+
     /// Block-preconditioned conjugate gradients on `(A W⁻¹ Aᵀ + λ) y = b`, then
     /// `x = W⁻¹ Aᵀ y`.
     fn solve(&self, lambda: f64) -> Vec<f64> {
         let m = self.rows.len();
         let n = self.inv_w.len();
-        let at = |y: &[f64]| {
-            let mut z = vec![0.0; n];
-            for (row, &yi) in self.rows.iter().zip(y) {
-                for &(j, a) in row {
-                    z[j] += a * yi;
-                }
+        // One buffer for `W⁻¹ Aᵀ p` and one for the product, reused by every iteration.
+        let mut z_n = vec![0.0; n];
+        let apply = |y: &[f64], z: &mut [f64], out: &mut [f64]| {
+            self.at(y, z);
+            for (i, (o, &yi)) in out.iter_mut().zip(y).enumerate() {
+                *o = self.rows.row(i).iter().map(|&(j, a)| a * z[j]).sum::<f64>() + lambda * yi;
             }
-            for (zj, w) in z.iter_mut().zip(&self.inv_w) {
-                *zj *= w;
-            }
-            z
-        };
-        let apply = |y: &[f64]| -> Vec<f64> {
-            let z = at(y);
-            self.rows
-                .iter()
-                .zip(y)
-                .map(|(row, &yi)| row.iter().map(|&(j, a)| a * z[j]).sum::<f64>() + lambda * yi)
-                .collect()
         };
         let inverses = self.block_inverses(lambda);
-        let precondition = |r: &[f64]| -> Vec<f64> {
-            let mut z = vec![0.0; m];
+        let precondition = |r: &[f64], z: &mut [f64]| {
+            z.fill(0.0);
             for (&(a, b), inv) in self.blocks.iter().zip(&inverses) {
                 let k = b - a;
                 for i in 0..k {
                     z[a + i] = (0..k).map(|l| inv[i * k + l] * r[a + l]).sum();
                 }
             }
-            z
         };
         let mut y = vec![0.0; m];
         let mut r = self.rhs.clone();
-        let mut z = precondition(&r);
+        let mut z = vec![0.0; m];
+        precondition(&r, &mut z);
         let mut p = z.clone();
+        let mut ap = vec![0.0; m];
         let mut rz: f64 = r.iter().zip(&z).map(|(a, b)| a * b).sum();
         let goal = 1e-4 * tol::LINEAR;
         // On nearly singular systems (faces that touch) the residual stalls far above the goal and
@@ -498,7 +528,7 @@ impl System {
                     break;
                 }
             }
-            let ap = apply(&p);
+            apply(&p, &mut z_n, &mut ap);
             let pap: f64 = p.iter().zip(&ap).map(|(a, b)| a * b).sum();
             if pap <= 0.0 || !pap.is_finite() {
                 break;
@@ -508,7 +538,7 @@ impl System {
                 y[i] += alpha * p[i];
                 r[i] -= alpha * ap[i];
             }
-            z = precondition(&r);
+            precondition(&r, &mut z);
             let rz_next: f64 = r.iter().zip(&z).map(|(a, b)| a * b).sum();
             let beta = rz_next / rz;
             rz = rz_next;
@@ -516,7 +546,8 @@ impl System {
                 p[i] = z[i] + beta * p[i];
             }
         }
-        at(&y)
+        self.at(&y, &mut z_n);
+        z_n
     }
 }
 
@@ -605,7 +636,9 @@ fn gauss_newton(raw: &mut Raw, faces: &[usize], targets: &mut [Target]) -> bool 
         *w = 1.0 / SURFACE_COST;
     }
     let mut hints: HashMap<(usize, usize), Vec2> = HashMap::new();
-    let mut state = linearize(raw, targets, &vars, &mut hints);
+    let Some(mut state) = linearize(raw, targets, &vars, &mut hints, None, 0) else {
+        unreachable!("rows without a bound are always built")
+    };
     let mut converged = false;
     for _round in 0..ROUNDS {
         if state.worst <= 0.05 * tol::LINEAR {
@@ -613,7 +646,7 @@ fn gauss_newton(raw: &mut Raw, faces: &[usize], targets: &mut [Target]) -> bool 
             break;
         }
         let mut sys = System {
-            rows: std::mem::take(&mut state.rows),
+            rows: Rows::of(&std::mem::take(&mut state.rows)),
             rhs: std::mem::take(&mut state.rhs),
             inv_w: inv_w.clone(),
             blocks: std::mem::take(&mut state.blocks),
@@ -652,8 +685,15 @@ fn gauss_newton(raw: &mut Raw, faces: &[usize], targets: &mut [Target]) -> bool 
                 t.at += t.moved_by(&x[3 * k..3 * k + 3]) * scale;
             }
             let mut trial_hints = hints.clone();
-            let next = linearize(raw, targets, &vars, &mut trial_hints);
-            if next.worst < state.worst {
+            let next = linearize(
+                raw,
+                targets,
+                &vars,
+                &mut trial_hints,
+                Some(state.worst),
+                state.worst_at,
+            );
+            if let Some(next) = next {
                 hints = trial_hints;
                 taken = Some(next);
                 break;
@@ -679,21 +719,33 @@ struct Linear {
     rhs: Vec<f64>,
     blocks: Vec<(usize, usize)>,
     worst: f64,
+    /// The target that lies `worst` from one of its faces.
+    worst_at: usize,
 }
 
+/// The rows of one Gauss–Newton step at `targets`, or `None` as soon as a target is found as far
+/// as `below` (where given) from one of its faces or farther: a step is kept only where it brings the worst
+/// gap below the last one, so the rows of a step that does not are never needed. The targets are
+/// measured first and the rows built only for a step that is kept, starting with target `first`,
+/// the worst before, which a step that overshoots usually leaves worse still.
 fn linearize(
     raw: &Raw,
     targets: &[Target],
     vars: &HashMap<usize, Vars>,
     hints: &mut HashMap<(usize, usize), Vec2>,
-) -> Linear {
-    let mut rows = Vec::new();
-    let mut rhs = Vec::new();
+    below: Option<f64>,
+    first: usize,
+) -> Option<Linear> {
     let mut worst: f64 = 0.0;
-    let mut blocks = Vec::with_capacity(targets.len());
-    for (k, t) in targets.iter().enumerate() {
-        let first = rows.len();
-        let fr = t.frame;
+    let mut worst_at = 0;
+    // Each target's nearest point on each of its faces, in the order of its faces.
+    let mut feet: Vec<Vec<(Vec2, Point3)>> = vec![Vec::new(); targets.len()];
+    let order = (first < targets.len())
+        .then_some(first)
+        .into_iter()
+        .chain((0..targets.len()).filter(|&k| k != first));
+    for k in order {
+        let t = &targets[k];
         for &f in &t.faces {
             let s = &raw.faces[f].surface;
             let uv = match hints.get(&(k, f)) {
@@ -702,8 +754,25 @@ fn linearize(
             };
             hints.insert((k, f), uv);
             let q = s.eval(uv.x, uv.y);
+            let gap = (t.at - q).norm();
+            if gap > worst {
+                (worst, worst_at) = (gap, k);
+            }
+            if below.is_some_and(|b| worst >= b) {
+                return None;
+            }
+            feet[k].push((uv, q));
+        }
+    }
+    let mut rows = Vec::new();
+    let mut rhs = Vec::new();
+    let mut blocks = Vec::with_capacity(targets.len());
+    for (k, t) in targets.iter().enumerate() {
+        let start = rows.len();
+        let fr = t.frame;
+        for (&f, &(uv, q)) in t.faces.iter().zip(&feet[k]) {
+            let s = &raw.faces[f].surface;
             let r = t.at - q;
-            worst = worst.max(r.norm());
             for d in directions(s, uv) {
                 let mut row = vec![
                     (3 * k, d.dot(fr[0])),
@@ -717,14 +786,15 @@ fn linearize(
                 rhs.push(-d.dot(r));
             }
         }
-        blocks.push((first, rows.len()));
+        blocks.push((start, rows.len()));
     }
-    Linear {
+    Some(Linear {
         rows,
         rhs,
         blocks,
         worst,
-    }
+        worst_at,
+    })
 }
 
 /// The columns of face unknowns `v` in the row for the distance of a point from `s` along `d`,

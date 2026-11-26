@@ -18,7 +18,7 @@ use super::topology::{Raw, edge_range, param_of};
 use crate::{
     Error, Result,
     geom::{BSpline, Curve, IntersectionCurve, Surface, refine_onto_both},
-    math::{Point3, Vec3},
+    math::{Point3, Vec2, Vec3},
     numeric::solve_dense,
     tol,
 };
@@ -36,6 +36,45 @@ fn fail<T>(id: u64, what: &str) -> Result<T> {
 fn surface_gap(s: &Surface, p: Point3) -> f64 {
     let uv = s.project(p);
     s.eval(uv.x, uv.y).dist(p)
+}
+
+/// Distances to a surface from points taken in turn along a curve, each found from the foot of
+/// the one before. Where the surface's nearest point is found by search (a B-spline, a swept or
+/// ruled surface), [`Surface::project_near`] keeps the foot Newton's method reaches from that hint
+/// only where it lies within the tolerance of the point (on a B-spline, within a share of its seed
+/// spacing, which global projection also stops at), and otherwise projects globally, as
+/// [`surface_gap`] does. A point that near one sheet of the surface can be nearer another only
+/// where two sheets come within the tolerance of each other, so the distance is the one global
+/// projection finds, without a global search at every point of a walk that stays on the
+/// surface. The elementary surfaces project in closed form, so they are projected afresh.
+struct Walk<'a> {
+    s: &'a Surface,
+    hint: Option<Vec2>,
+}
+
+impl<'a> Walk<'a> {
+    fn on(s: &'a Surface) -> Walk<'a> {
+        Walk { s, hint: None }
+    }
+
+    /// The distance from `p` to the surface.
+    fn gap(&mut self, p: Point3) -> f64 {
+        let s = self.s;
+        let uv = match (s, self.hint) {
+            (
+                Surface::Plane(_)
+                | Surface::Cylinder(_)
+                | Surface::Cone(_)
+                | Surface::Sphere(_)
+                | Surface::Torus(_),
+                _,
+            )
+            | (_, None) => s.project(p),
+            (_, Some(h)) => s.project_near(p, h),
+        };
+        self.hint = Some(uv);
+        s.eval(uv.x, uv.y).dist(p)
+    }
 }
 
 /// The even steps [`crate::check`] samples an edge at.
@@ -332,14 +371,14 @@ fn refit(
         };
         let params = chord_params(&pts, closed);
         let n_seg = params.len() - 1;
+        // The samples are taken in order along the spline, so each is projected from the last.
+        let (mut wa, mut wb) = (Walk::on(a), Walk::on(b));
+        let mut gap = |m: Point3| wa.gap(m).max(wb.gap(m));
         let err: Vec<f64> = (0..n_seg)
             .map(|i| {
                 [0.25, 0.5, 0.75]
                     .iter()
-                    .map(|f| {
-                        let m = approx.eval(params[i] + (params[i + 1] - params[i]) * f);
-                        surface_gap(a, m).max(surface_gap(b, m))
-                    })
+                    .map(|f| gap(approx.eval(params[i] + (params[i + 1] - params[i]) * f)))
                     .fold(0.0, f64::max)
             })
             .collect();
@@ -347,15 +386,20 @@ fn refit(
             let dom = approx.domain();
             // A spline that stays on both faces everywhere is the edge as it is: evaluating it
             // costs nothing, where an intersection curve refines every point onto both faces.
+            let (mut wa, mut wb) = (Walk::on(a), Walk::on(b));
+            let mut gap = |m: Point3| wa.gap(m).max(wb.gap(m));
             let on_both = (0..n_seg).all(|i| {
                 (1..8).all(|k| {
                     let m = approx.eval(params[i] + (params[i + 1] - params[i]) * k as f64 / 8.0);
-                    surface_gap(a, m).max(surface_gap(b, m)) <= 0.5 * tol::LINEAR
+                    gap(m) <= 0.5 * tol::LINEAR
                 })
-            }) && (1..CHECK_SAMPLES).all(|k| {
-                let m = approx.eval(dom.0 + (dom.1 - dom.0) * k as f64 / CHECK_SAMPLES as f64);
-                surface_gap(a, m).max(surface_gap(b, m)) <= 0.5 * tol::LINEAR
-            });
+            }) && {
+                let (mut wa, mut wb) = (Walk::on(a), Walk::on(b));
+                (1..CHECK_SAMPLES).all(|k| {
+                    let m = approx.eval(dom.0 + (dom.1 - dom.0) * k as f64 / CHECK_SAMPLES as f64);
+                    wa.gap(m).max(wb.gap(m)) <= 0.5 * tol::LINEAR
+                })
+            };
             let curve = if on_both {
                 Curve::BSpline(approx)
             } else {
@@ -457,6 +501,26 @@ fn range_of(raw: &Raw, e: usize) -> Option<(f64, f64)> {
     )
 }
 
+/// What [`refit`] made of an edge, from what: the version of each face's surface, the edge's ends
+/// and range, and the points the surface step placed along it.
+type RefitKey = (
+    [usize; 2],
+    [Point3; 2],
+    Option<(f64, f64)>,
+    Option<Vec<Point3>>,
+);
+type Refitted = std::result::Result<(Curve, (f64, f64)), String>;
+
+/// The edges [`heal`] has refitted in earlier rounds. A round moves only the surfaces of the faces
+/// it adjusts, so an edge whose two faces kept their surfaces, and whose ends and range came out
+/// the same, refits as it did before: [`refit`] reads nothing else.
+#[derive(Default)]
+struct Refits {
+    /// How many times each face's surface has moved.
+    versions: Vec<usize>,
+    done: HashMap<usize, (RefitKey, Refitted)>,
+}
+
 /// Moves each vertex that misses its faces onto them, starting from `start` where given, and
 /// refits each edge that still misses. Returns each edge's range, or every vertex and edge that
 /// would not fit. `loose` refits the edges at a vertex that would not move too, from where it is.
@@ -465,6 +529,7 @@ fn attempt(
     start: &HashMap<usize, Point3>,
     samples: &HashMap<usize, Vec<Point3>>,
     loose: bool,
+    mut refits: Option<&mut Refits>,
 ) -> std::result::Result<Vec<(f64, f64)>, Vec<Failure>> {
     let ranges: Vec<Option<(f64, f64)>> = (0..raw.edges.len()).map(|e| range_of(raw, e)).collect();
     let fits: Vec<bool> = (0..raw.edges.len())
@@ -552,11 +617,35 @@ fn attempt(
             out.push(r.unwrap_or((0.0, 0.0)));
             continue;
         }
-        let rf = match samples.get(&e) {
+        let fresh = || match samples.get(&e) {
             Some(s) => {
                 refit(raw, e, r.or(old), Some(s)).or_else(|_| refit(raw, e, r.or(old), None))
             }
             None => refit(raw, e, r.or(old), None),
+        };
+        let rf = match refits.as_deref_mut() {
+            Some(memo) => {
+                let (fa, fb) = match edge.faces[..] {
+                    [fa, fb] => (fa.min(fb), fa.max(fb)),
+                    _ => (usize::MAX, usize::MAX),
+                };
+                let version = |f: usize| memo.versions.get(f).copied().unwrap_or(usize::MAX);
+                let key = (
+                    [version(fa), version(fb)],
+                    [raw.points[edge.start], raw.points[edge.end]],
+                    r.or(old),
+                    samples.get(&e).cloned(),
+                );
+                match memo.done.get(&e) {
+                    Some((k, rf)) if *k == key => rf.clone(),
+                    _ => {
+                        let rf = fresh();
+                        memo.done.insert(e, (key, rf.clone()));
+                        rf
+                    }
+                }
+            }
+            None => fresh(),
         };
         match rf {
             Ok((curve, r)) => {
@@ -757,6 +846,10 @@ pub(super) fn heal(raw: &mut Raw) -> Result<Ranges> {
     let mut samples: HashMap<usize, Vec<Point3>> = HashMap::new();
     let mut settled = true;
     let mut failed_before = usize::MAX;
+    let mut refits = Refits {
+        versions: vec![0; file.faces.len()],
+        ..Refits::default()
+    };
     let with_surfaces = |surfaces: &[Surface]| {
         let mut r = file.clone();
         for (f, s) in r.faces.iter_mut().zip(surfaces) {
@@ -766,7 +859,7 @@ pub(super) fn heal(raw: &mut Raw) -> Result<Ranges> {
     };
     for round in 0..=ADJUST_ROUNDS {
         let mut work = with_surfaces(&surfaces);
-        let failures = match attempt(&mut work, &start, &samples, false) {
+        let failures = match attempt(&mut work, &start, &samples, false, Some(&mut refits)) {
             Ok(ranges) => {
                 let healed = movement(&file, &work, &chosen);
                 if let Some(h) = healed.as_ref().filter(|h| h.moved > MAX_HEAL) {
@@ -821,6 +914,11 @@ pub(super) fn heal(raw: &mut Raw) -> Result<Ranges> {
         let faces: Vec<usize> = chosen.iter().copied().collect();
         let (at, met) = adjust(&mut shaped, &faces, &mut pts);
         settled = met;
+        for (f, face) in shaped.faces.iter().enumerate() {
+            if face.surface != surfaces[f] {
+                refits.versions[f] += 1;
+            }
+        }
         surfaces = shaped.faces.into_iter().map(|f| f.surface).collect();
         start = at;
         samples.clear();
@@ -840,7 +938,7 @@ pub(super) fn heal(raw: &mut Raw) -> Result<Ranges> {
 /// be further off than the file promises until it is refitted. Returns how far it moved.
 pub(super) fn heal_loosely(raw: &mut Raw) -> Option<Healed> {
     let file = raw.clone();
-    let _ = attempt(raw, &HashMap::new(), &HashMap::new(), true);
+    let _ = attempt(raw, &HashMap::new(), &HashMap::new(), true, None);
     movement(&file, raw, &BTreeSet::new())
 }
 
@@ -1098,4 +1196,66 @@ pub(super) fn misfit(raw: &Raw) -> Option<String> {
         return Some(format!("edge #{} lies {gap:.1e} mm off face #{f}", edge.id));
     }
     None
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::geom::{NurbsSurface, Revolution};
+    use std::f64::consts::{FRAC_1_SQRT_2, FRAC_PI_2, TAU};
+
+    /// A quarter of the cylinder of radius 1 about the z axis, 0 ≤ z ≤ 2, as a rational quadratic
+    /// by linear patch.
+    fn quarter_cylinder() -> Surface {
+        let arc = [(1.0, 0.0, 1.0), (1.0, 1.0, FRAC_1_SQRT_2), (0.0, 1.0, 1.0)];
+        let mut ctrl = Vec::new();
+        let mut weights = Vec::new();
+        for &(x, y, w) in &arc {
+            for z in [0.0, 2.0] {
+                ctrl.push(Vec3::new(x, y, z));
+                weights.push(w);
+            }
+        }
+        let knots = (vec![0.0, 0.0, 0.0, 1.0, 1.0, 1.0], vec![0.0, 0.0, 1.0, 1.0]);
+        let s = NurbsSurface::new((2, 1), knots, (3, 2), ctrl, Some(weights)).unwrap();
+        Surface::Nurbs(Box::new(s))
+    }
+
+    /// The cylinder of radius 2 about the z axis, 0 ≤ z ≤ 2, as a straight meridian turned about
+    /// the axis.
+    fn turned_cylinder() -> Surface {
+        let meridian = [0.0, 1.0, 2.0].map(|z| Vec3::new(2.0, 0.0, z));
+        Surface::Revolution(Box::new(Revolution {
+            curve: Curve::BSpline(BSpline::interpolate(&meridian).unwrap()),
+            origin: Vec3::ZERO,
+            axis: Vec3::Z,
+        }))
+    }
+
+    // A point at radius r + d from a cylinder's axis, between its ends and within the angle the
+    // surface spans, lies |d| from it. A walk projects each point from the last one's foot, so it
+    // must measure the same distance there whether the point is on the surface, a hair off it, or
+    // too far off for the foot from a hint to be taken on trust.
+    #[test]
+    fn a_walk_measures_each_point_as_projecting_afresh_does() {
+        for (s, r, turn) in [
+            (quarter_cylinder(), 1.0, FRAC_PI_2),
+            (turned_cylinder(), 2.0, TAU),
+        ] {
+            let mut walk = Walk::on(&s);
+            for k in 0..=64 {
+                let t = k as f64 / 64.0;
+                let d = [0.0, 3e-8, -2e-7, 1e-3, -0.25][k % 5];
+                let a = 0.02 + (turn - 0.04) * t;
+                let p = Point3::new((r + d) * a.cos(), (r + d) * a.sin(), 0.1 + 1.8 * t);
+                let gap = walk.gap(p);
+                assert!((gap - d.abs()).abs() <= 1e-12, "{}: {k}: {gap:e}", s.kind());
+                assert!(
+                    (gap - surface_gap(&s, p)).abs() <= 1e-12,
+                    "{}: {k}",
+                    s.kind()
+                );
+            }
+        }
+    }
 }

@@ -2195,7 +2195,10 @@ solid never pinches.
      still misses is refitted through its vertices onto both its faces' surfaces. A refit follows
      the file's curve bent to the moved vertices, so where two faces touch it stays on the line of
      the vertices rather than a second line beside it; a refit that stays on both faces everywhere
-     is kept as its spline, otherwise as an intersection curve.
+     is kept as its spline, otherwise as an intersection curve. The refit's checks sample its
+     spline in order and project each sample from the foot of the one before
+     (`Surface::project_near`), which searches globally only where that foot is not within the
+     tolerance; a global search at every sample cost most of the healing of a large file.
   2. Where faces miss each other, so that step fails (three surfaces with no common point at a
      vertex, two faces that touch rather than cross, a B-spline face that stops short of its
      corner), the surfaces of the faces involved move too ([`adjust.rs`](../src/step/adjust.rs)).
@@ -2211,7 +2214,11 @@ solid never pinches.
      follow the other surface closely enough (a cubic blend boundary along a curve on a cylinder),
      the step starts again with knots inserted until each parameter has 16 spans; the points it
      placed along an edge that would not fit seed that edge's refit, since two touching faces meet
-     anywhere across a band. Step 1 then runs again on the moved surfaces, up to three times.
+     anywhere across a band. Step 1 then runs again on the moved surfaces, up to three times; an
+     edge whose two faces kept their surfaces, and whose ends, range and samples came out the same,
+     keeps the refit of the round before, since a refit reads nothing else. A Gauss–Newton trial
+     step is dropped as soon as one target ends as far from its faces as the worst before it,
+     checking that worst target first, and its rows are built only once it is kept.
   3. Every solid records how far its geometry moved: the largest distance any vertex, edge or
      surface moved, what moved and where, and the largest surface movement on its own, which bounds
      how far a face moved. `Import::healed` carries it for each placed solid, for the caller to

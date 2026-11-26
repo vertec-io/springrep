@@ -2198,7 +2198,10 @@ solid never pinches.
      is kept as its spline, otherwise as an intersection curve. The refit's checks sample its
      spline in order and project each sample from the foot of the one before
      (`Surface::project_near`), which searches globally only where that foot is not within the
-     tolerance; a global search at every sample cost most of the healing of a large file.
+     tolerance; a global search at every sample cost most of the healing of a large file. A
+     refit reads only its own edge's curve, its two faces and its vertices, so the edges of a
+     solid are refitted on as many threads as the machine offers and taken in edge order: a
+     solid of thousands of edges that miss does not wait on one thread for all of them.
   2. Where faces miss each other, so that step fails (three surfaces with no common point at a
      vertex, two faces that touch rather than cross, a B-spline face that stops short of its
      corner), the surfaces of the faces involved move too ([`adjust.rs`](../src/step/adjust.rs)).
@@ -2218,7 +2221,9 @@ solid never pinches.
      edge whose two faces kept their surfaces, and whose ends, range and samples came out the same,
      keeps the refit of the round before, since a refit reads nothing else. A Gauss–Newton trial
      step is dropped as soon as one target ends as far from its faces as the worst before it,
-     checking that worst target first, and its rows are built only once it is kept.
+     checking that worst target first, and its rows are built only once it is kept. Each target's
+     nearest points on its faces, and its rows, depend on that target alone, so where there are
+     thousands they are found on threads too, and measured and laid out in target order.
   3. Every solid records how far its geometry moved: the largest distance any vertex, edge or
      surface moved, what moved and where, and the largest surface movement on its own, which bounds
      how far a face moved. `Import::healed` carries it for each placed solid, for the caller to
@@ -2244,7 +2249,9 @@ solid never pinches.
   rejected for its structure, the geometry each entity lies on, and its loops
   (`check::check_structure`), not for passing through itself: a solid whose faces meet away from
   their shared edges is kept, and each place is reported in `Import::crossed` with the two faces,
-  the point, and how far one passes through the other (`check::self_crossings`). One imported mesh
+  the point, and how far one passes through the other (`check::self_crossings`). That search takes
+  about as long as healing a solid, so it runs on the thread that built the solid, as the solids are
+  built side by side, rather than for each solid in turn after all are built. One imported mesh
   of 23442 triangles folds through itself at four corners, up to 0.014 mm deep. The data is the part
   as its file gives it, and refusing it refused the whole part. A boolean that cuts through such a
   fold may still fail.

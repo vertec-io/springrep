@@ -20,7 +20,7 @@ use crate::{
     geom::{BSpline, Curve, IntersectionCurve, Surface, refine_onto_both},
     math::{Point3, Vec2, Vec3},
     numeric::solve_dense,
-    tol,
+    threads, tol,
 };
 
 /// How far healing may move a vertex, in mm, and in multiples of how far it was from meeting its
@@ -501,6 +501,9 @@ fn range_of(raw: &Raw, e: usize) -> Option<(f64, f64)> {
     )
 }
 
+/// The fewest refits worth a thread of their own: a refit takes milliseconds, a thread far less.
+const REFITS_PER_RUN: usize = 8;
+
 /// What [`refit`] made of an edge, from what: the version of each face's surface, the edge's ends
 /// and range, and the points the surface step placed along it.
 type RefitKey = (
@@ -602,11 +605,14 @@ fn attempt(
         })
     };
 
-    let mut out = Vec::with_capacity(raw.edges.len());
+    // Each edge is kept, or refitted from its own curve, its faces and its ends alone, so the
+    // refits are independent of each other: they are made on as many threads as there are, and
+    // taken in the order of the edges.
+    let mut out = vec![(0.0, 0.0); raw.edges.len()];
+    let mut todo: Vec<(usize, Option<(f64, f64)>)> = Vec::new();
     for (e, &old) in ranges.iter().enumerate() {
         let edge = &raw.edges[e];
         if !loose && (stuck[edge.start] || stuck[edge.end]) {
-            out.push((0.0, 0.0));
             continue;
         }
         let r = match old {
@@ -614,48 +620,70 @@ fn attempt(
             None => range_of(raw, e),
         };
         if edge_fits(raw, e, r) && ends_close(raw, e, r) {
-            out.push(r.unwrap_or((0.0, 0.0)));
+            out[e] = r.unwrap_or((0.0, 0.0));
             continue;
         }
-        let fresh = || match samples.get(&e) {
-            Some(s) => {
-                refit(raw, e, r.or(old), Some(s)).or_else(|_| refit(raw, e, r.or(old), None))
-            }
-            None => refit(raw, e, r.or(old), None),
+        todo.push((e, r.or(old)));
+    }
+    let key = |memo: &Refits, e: usize, r: Option<(f64, f64)>| -> RefitKey {
+        let edge = &raw.edges[e];
+        let (fa, fb) = match edge.faces[..] {
+            [fa, fb] => (fa.min(fb), fa.max(fb)),
+            _ => (usize::MAX, usize::MAX),
         };
-        let rf = match refits.as_deref_mut() {
-            Some(memo) => {
-                let (fa, fb) = match edge.faces[..] {
-                    [fa, fb] => (fa.min(fb), fa.max(fb)),
-                    _ => (usize::MAX, usize::MAX),
-                };
-                let version = |f: usize| memo.versions.get(f).copied().unwrap_or(usize::MAX);
-                let key = (
-                    [version(fa), version(fb)],
-                    [raw.points[edge.start], raw.points[edge.end]],
-                    r.or(old),
-                    samples.get(&e).cloned(),
-                );
-                match memo.done.get(&e) {
-                    Some((k, rf)) if *k == key => rf.clone(),
-                    _ => {
-                        let rf = fresh();
-                        memo.done.insert(e, (key, rf.clone()));
-                        rf
-                    }
-                }
+        let version = |f: usize| memo.versions.get(f).copied().unwrap_or(usize::MAX);
+        (
+            [version(fa), version(fb)],
+            [raw.points[edge.start], raw.points[edge.end]],
+            r,
+            samples.get(&e).cloned(),
+        )
+    };
+    let keys: Vec<Option<RefitKey>> = todo
+        .iter()
+        .map(|&(e, r)| refits.as_deref().map(|memo| key(memo, e, r)))
+        .collect();
+    let kept: Vec<Option<Refitted>> = todo
+        .iter()
+        .zip(&keys)
+        .map(|(&(e, _), k)| match (refits.as_deref(), k) {
+            (Some(memo), Some(k)) => memo
+                .done
+                .get(&e)
+                .filter(|(old, _)| old == k)
+                .map(|(_, rf)| rf.clone()),
+            _ => None,
+        })
+        .collect();
+    let fresh: Vec<usize> = (0..todo.len()).filter(|&i| kept[i].is_none()).collect();
+    let made = {
+        let raw = &*raw;
+        threads::map(fresh.len(), REFITS_PER_RUN, |i| {
+            let (e, r) = todo[fresh[i]];
+            match samples.get(&e) {
+                Some(s) => refit(raw, e, r, Some(s)).or_else(|_| refit(raw, e, r, None)),
+                None => refit(raw, e, r, None),
             }
-            None => fresh(),
+        })
+    };
+    let mut made = made.into_iter();
+    for ((&(e, _), k), rf) in todo.iter().zip(keys).zip(kept) {
+        let rf = match rf {
+            Some(rf) => rf,
+            None => {
+                let rf = made.next().expect("one refit made for each edge not kept");
+                if let (Some(memo), Some(k)) = (refits.as_deref_mut(), k) {
+                    memo.done.insert(e, (k, rf.clone()));
+                }
+                rf
+            }
         };
         match rf {
             Ok((curve, r)) => {
                 raw.edges[e].curve = curve;
-                out.push(r);
+                out[e] = r;
             }
-            Err(why) => {
-                failures.push(Failure::Edge(e, why));
-                out.push((0.0, 0.0));
-            }
+            Err(why) => failures.push(Failure::Edge(e, why)),
         }
     }
     if failures.is_empty() {

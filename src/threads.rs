@@ -13,6 +13,33 @@ pub(crate) fn spread<T: Send>(most: usize, work: impl Fn() -> T + Sync) -> Vec<T
     on(offered.min(most), work)
 }
 
+/// `f` of each of `0..n`, in order, with the items taken `chunk` at a time by as many runs of
+/// [`spread`] as there are chunks. Each value is what `f` gives for its item on whichever thread,
+/// so the result is the one a loop over `0..n` gives; one chunk is that loop.
+pub(crate) fn map<T: Send>(n: usize, chunk: usize, f: impl Fn(usize) -> T + Sync) -> Vec<T> {
+    use std::sync::atomic::{AtomicUsize, Ordering};
+    let chunk = chunk.max(1);
+    let chunks = n.div_ceil(chunk);
+    if chunks <= 1 {
+        return (0..n).map(f).collect();
+    }
+    let next = AtomicUsize::new(0);
+    let runs = spread(chunks, || {
+        let mut mine = Vec::new();
+        loop {
+            let c = next.fetch_add(1, Ordering::Relaxed);
+            if c >= chunks {
+                break mine;
+            }
+            let items = c * chunk..((c + 1) * chunk).min(n);
+            mine.push((c, items.map(&f).collect::<Vec<T>>()));
+        }
+    });
+    let mut parts: Vec<(usize, Vec<T>)> = runs.into_iter().flatten().collect();
+    parts.sort_unstable_by_key(|p| p.0);
+    parts.into_iter().flat_map(|p| p.1).collect()
+}
+
 /// [`spread`] over `threads` threads, the calling thread among them, or over as many of them as
 /// can be spawned.
 fn on<T: Send>(threads: usize, work: impl Fn() -> T + Sync) -> Vec<T> {
@@ -71,6 +98,19 @@ mod tests {
                 "{runs} runs on {threads} threads"
             );
         }
+    }
+
+    #[test]
+    fn a_map_gives_each_item_in_order_however_it_is_chunked() {
+        let want: Vec<usize> = (0..1000).map(|i| 3 * i + 1).collect();
+        for chunk in [0, 1, 7, 64, 1000, 5000] {
+            assert_eq!(
+                super::map(1000, chunk, |i| 3 * i + 1),
+                want,
+                "chunks of {chunk}"
+            );
+        }
+        assert!(super::map(0, 4, |i| i).is_empty());
     }
 
     #[test]

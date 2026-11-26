@@ -15,7 +15,7 @@ use crate::{
     geom::{NurbsSurface, Surface},
     math::{Point3, Transform, Vec2, Vec3},
     numeric::solve_dense,
-    tol,
+    threads, tol,
 };
 
 /// What moving a surface by a length costs, against moving a point by the same length (1).
@@ -419,6 +419,11 @@ impl Rows {
     }
 }
 
+/// The fewest targets whose feet and rows are found on threads, and how many each thread takes
+/// at a time.
+const PARALLEL_TARGETS: usize = 2048;
+const TARGETS_PER_RUN: usize = 256;
+
 /// A sparse system `A x = b`, solved for the `x` of least weighted norm `Σ wⱼ xⱼ²`.
 struct System {
     rows: Rows,
@@ -736,41 +741,95 @@ fn linearize(
     below: Option<f64>,
     first: usize,
 ) -> Option<Linear> {
-    let mut worst: f64 = 0.0;
-    let mut worst_at = 0;
-    // Each target's nearest point on each of its faces, in the order of its faces.
-    let mut feet: Vec<Vec<(Vec2, Point3)>> = vec![Vec::new(); targets.len()];
-    let order = (first < targets.len())
-        .then_some(first)
-        .into_iter()
-        .chain((0..targets.len()).filter(|&k| k != first));
-    for k in order {
+    linearize_from(raw, targets, vars, hints, below, first, PARALLEL_TARGETS)
+}
+
+/// [`linearize`], on threads from `parallel` targets up.
+fn linearize_from(
+    raw: &Raw,
+    targets: &[Target],
+    vars: &HashMap<usize, Vars>,
+    hints: &mut HashMap<(usize, usize), Vec2>,
+    below: Option<f64>,
+    first: usize,
+    parallel: usize,
+) -> Option<Linear> {
+    // Each target's nearest point on each of its faces, in the order of its faces, from its
+    // hints, and the hints it leaves. A target's feet depend on nothing but the target, so a large
+    // set of them is found on as many threads as there are.
+    let feet_of = |k: usize| -> Vec<(usize, Vec2, Point3)> {
         let t = &targets[k];
+        let mut out: Vec<(usize, Vec2, Point3)> = Vec::with_capacity(t.faces.len());
         for &f in &t.faces {
             let s = &raw.faces[f].surface;
-            let uv = match hints.get(&(k, f)) {
-                Some(&h) => s.project_near(t.at, h),
+            // A face listed twice is projected from the foot found the first time.
+            let hint = out.iter().rev().find(|x| x.0 == f).map(|x| x.1);
+            let uv = match hint.or_else(|| hints.get(&(k, f)).copied()) {
+                Some(h) => s.project_near(t.at, h),
                 None => s.project(t.at),
             };
-            hints.insert((k, f), uv);
-            let q = s.eval(uv.x, uv.y);
-            let gap = (t.at - q).norm();
+            out.push((f, uv, s.eval(uv.x, uv.y)));
+        }
+        out
+    };
+    let mut feet: Vec<Vec<(usize, Vec2, Point3)>> = vec![Vec::new(); targets.len()];
+    let first = (first < targets.len()).then_some(first);
+    if let Some(k) = first {
+        feet[k] = feet_of(k);
+    }
+    let mut worst: f64 = 0.0;
+    let mut worst_at = 0;
+    let mut measure = |k: usize, feet: &[(usize, Vec2, Point3)]| -> bool {
+        for &(_, _, q) in feet {
+            let gap = (targets[k].at - q).norm();
             if gap > worst {
                 (worst, worst_at) = (gap, k);
             }
             if below.is_some_and(|b| worst >= b) {
+                return false;
+            }
+        }
+        true
+    };
+    // The worst target before is measured first: a step that overshoots usually leaves it worse
+    // still, and then no other target need be projected.
+    if let Some(k) = first
+        && !measure(k, &feet[k])
+    {
+        return None;
+    }
+    let rest: Vec<usize> = (0..targets.len()).filter(|&k| Some(k) != first).collect();
+    let found = if rest.len() >= parallel {
+        threads::map(rest.len(), TARGETS_PER_RUN, |i| feet_of(rest[i]))
+    } else {
+        let mut found = Vec::with_capacity(rest.len());
+        for &k in &rest {
+            let f = feet_of(k);
+            if !measure(k, &f) {
                 return None;
             }
-            feet[k].push((uv, q));
+            found.push(f);
+        }
+        found
+    };
+    let measured = rest.len() < parallel;
+    for (&k, f) in rest.iter().zip(found) {
+        if !measured && !measure(k, &f) {
+            return None;
+        }
+        feet[k] = f;
+    }
+    for (k, f) in feet.iter().enumerate() {
+        for &(face, uv, _) in f {
+            hints.insert((k, face), uv);
         }
     }
-    let mut rows = Vec::new();
-    let mut rhs = Vec::new();
-    let mut blocks = Vec::with_capacity(targets.len());
-    for (k, t) in targets.iter().enumerate() {
-        let start = rows.len();
+    let rows_of = |k: usize| {
+        let t = &targets[k];
         let fr = t.frame;
-        for (&f, &(uv, q)) in t.faces.iter().zip(&feet[k]) {
+        let mut rows = Vec::new();
+        let mut rhs = Vec::new();
+        for &(f, uv, q) in &feet[k] {
             let s = &raw.faces[f].surface;
             let r = t.at - q;
             for d in directions(s, uv) {
@@ -786,6 +845,20 @@ fn linearize(
                 rhs.push(-d.dot(r));
             }
         }
+        (rows, rhs)
+    };
+    let built = if targets.len() >= parallel {
+        threads::map(targets.len(), TARGETS_PER_RUN, rows_of)
+    } else {
+        (0..targets.len()).map(rows_of).collect()
+    };
+    let mut rows = Vec::new();
+    let mut rhs = Vec::new();
+    let mut blocks = Vec::with_capacity(targets.len());
+    for (r, b) in built {
+        let start = rows.len();
+        rows.extend(r);
+        rhs.extend(b);
         blocks.push((start, rows.len()));
     }
     Some(Linear {
@@ -856,6 +929,113 @@ fn moved(s: &Surface, dofs: &Dofs, xs: &[f64]) -> Option<Surface> {
             let same = m.u_period().is_some() == n.u_period().is_some()
                 && m.v_period().is_some() == n.v_period().is_some();
             same.then(|| Surface::Nurbs(Box::new(m)))
+        }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::geom::{NurbsSurface, Plane};
+    use crate::math::Frame;
+    use crate::step::topology::RawFace;
+    use std::f64::consts::FRAC_1_SQRT_2;
+
+    /// A quarter of the cylinder of radius 1 about the z axis, 0 ≤ z ≤ 2, as a rational quadratic
+    /// by linear patch, and the plane z = 1 that cuts it along a quarter circle.
+    fn quarter_cylinder_and_plane() -> Raw {
+        let arc = [(1.0, 0.0, 1.0), (1.0, 1.0, FRAC_1_SQRT_2), (0.0, 1.0, 1.0)];
+        let mut ctrl = Vec::new();
+        let mut weights = Vec::new();
+        for &(x, y, w) in &arc {
+            for z in [0.0, 2.0] {
+                ctrl.push(Vec3::new(x, y, z));
+                weights.push(w);
+            }
+        }
+        let knots = (vec![0.0, 0.0, 0.0, 1.0, 1.0, 1.0], vec![0.0, 0.0, 1.0, 1.0]);
+        let n = NurbsSurface::new((2, 1), knots, (3, 2), ctrl, Some(weights)).unwrap();
+        let frame = Frame::new(Vec3::new(0.0, 0.0, 1.0), Vec3::Z, Vec3::X).unwrap();
+        let face = |surface| RawFace {
+            id: 0,
+            name: String::new(),
+            surface,
+            reversed: false,
+            bounds: Vec::new(),
+            points: Vec::new(),
+        };
+        Raw {
+            faces: vec![
+                face(Surface::Nurbs(Box::new(n))),
+                face(Surface::Plane(Plane { frame })),
+            ],
+            ..Raw::default()
+        }
+    }
+
+    // Points near the quarter circle where the faces meet, each a little off it, so that each
+    // lies a known distance from each face: r - 1 from the cylinder and |z - 1| from the plane.
+    // Their feet, rows and worst gap are the same to the bit whether they are found on one
+    // thread or on several, and so is whether a step that leaves a target too far is dropped.
+    #[test]
+    fn a_step_is_linearized_the_same_on_one_thread_and_on_several() {
+        let raw = quarter_cylinder_and_plane();
+        let n = 3000;
+        let targets: Vec<Target> = (0..n)
+            .map(|k| {
+                let a = 0.05 + 1.4 * k as f64 / n as f64;
+                let (r, z) = (1.0 + 1e-7 * (k % 7) as f64, 1.0 - 1e-7 * (k % 5) as f64);
+                let at = Vec3::new(r * a.cos(), r * a.sin(), z);
+                // Some targets list a face twice, as a seam's sample does.
+                let faces = if k % 11 == 0 {
+                    vec![0, 1, 0]
+                } else {
+                    vec![0, 1]
+                };
+                Target::sample(&raw, at, faces, 0, Vec3::new(-a.sin(), a.cos(), 0.0))
+            })
+            .collect();
+        let mut vars = HashMap::new();
+        let (group_of, groups) = control_groups(match &raw.faces[0].surface {
+            Surface::Nurbs(n) => n.control_points(),
+            _ => unreachable!(),
+        });
+        vars.insert(
+            0,
+            Vars {
+                first: 3 * n,
+                dofs: Dofs::Control { group_of, groups },
+            },
+        );
+        let run = |parallel: usize, below: Option<f64>, first: usize| {
+            let mut hints = HashMap::new();
+            let got = linearize_from(&raw, &targets, &vars, &mut hints, None, 0, parallel)
+                .map(|l| (l.rows, l.rhs, l.blocks, l.worst.to_bits(), l.worst_at));
+            // A second step from the feet found by the first, as the next round takes.
+            let next = linearize_from(&raw, &targets, &vars, &mut hints, below, first, parallel)
+                .map(|l| (l.rows, l.rhs, l.blocks, l.worst.to_bits(), l.worst_at));
+            let mut hints: Vec<_> = hints.into_iter().collect();
+            hints.sort_by_key(|h| h.0);
+            (
+                format!("{got:?}"),
+                format!("{next:?}"),
+                format!("{hints:?}"),
+            )
+        };
+        let (one, _, _) = run(usize::MAX, None, 0);
+        assert!(one.contains("Some"));
+        // The worst target lies 6e-7 from the cylinder; a step is dropped once one is as far.
+        for (below, first) in [
+            (None, 0),
+            (Some(1.0), 3),
+            (Some(5e-7), 0),
+            (Some(5e-7), 2999),
+        ] {
+            let serial = run(usize::MAX, below, first);
+            let threaded = run(1, below, first);
+            assert_eq!(serial, threaded, "below {below:?}, from target {first}");
+            let kept = serial.1.contains("Some");
+            assert_eq!(kept, below.is_none_or(|b| b > 6.0e-7), "below {below:?}");
         }
     }
 }

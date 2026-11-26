@@ -575,7 +575,6 @@ pub fn read_with(text: &[u8], feature: &str, options: &ReadOptions) -> Result<Im
     let mut healed = Vec::new();
     let mut tolerant = Vec::new();
     let mut crossed = Vec::new();
-    let mut crossings: HashMap<Key, Vec<check::SelfCrossing>> = HashMap::new();
     let mut counter = 0usize;
     let mut index = 0usize;
     let colours = colours(&file);
@@ -584,11 +583,8 @@ pub fn read_with(text: &[u8], feature: &str, options: &ReadOptions) -> Result<Im
     for pl in placements {
         match &built[&pl.key()] {
             Err(e) => rejected.push(format!("#{}: {e}", pl.solid)),
-            Ok((b, names, heal, stated)) => {
-                let found = crossings
-                    .entry(pl.key())
-                    .or_insert_with(|| check::self_crossings(b))
-                    .clone();
+            Ok((b, names, heal, stated, found)) => {
+                let found = found.clone();
                 if options.strict {
                     let through = found.iter().filter(|x| x.depth > tol::LINEAR);
                     if let Some(deepest) = through.clone().map(|x| x.depth).reduce(f64::max) {
@@ -787,9 +783,18 @@ fn colours(file: &File) -> HashMap<u64, [f64; 3]> {
     out
 }
 
-/// A solid, its faces' ids and names, how far healing moved it, and the uncertainty its file
-/// states.
-type Built = std::result::Result<(Brep, Vec<(u64, String)>, Option<Healed>, Option<f64>), String>;
+/// A solid, its faces' ids and names, how far healing moved it, the uncertainty its file states,
+/// and where it passes through itself.
+type Built = std::result::Result<
+    (
+        Brep,
+        Vec<(u64, String)>,
+        Option<Healed>,
+        Option<f64>,
+        Vec<check::SelfCrossing>,
+    ),
+    String,
+>;
 
 /// A rough measure of how long a solid takes to build: its faces, and the control points of its
 /// spline surfaces, which healing fits.
@@ -858,11 +863,11 @@ fn guarded<C, T>(
     })
 }
 
-/// Builds each distinct solid once. Solids share nothing but the file, so they are built on as
-/// many threads as the machine offers, each with its own geometry cache, heaviest first so that
-/// no long build starts last. Each result is filed under its own key, whatever finished first.
-/// A solid whose build panics is rejected and the rest are still built, where panics unwind
-/// ([`guarded`]).
+/// Builds each distinct solid once, and finds where it passes through itself. Solids share
+/// nothing but the file, so they are built on as many threads as the machine offers, each with its
+/// own geometry cache, heaviest first so that no long build starts last. Each result is filed under
+/// its own key, whatever finished first. A solid whose build panics is rejected and the rest are
+/// still built, where panics unwind ([`guarded`]).
 fn build_all(file: &File, keys: &[Key], strict: bool) -> HashMap<Key, Built> {
     let mut order: Vec<(usize, usize)> = keys
         .iter()
@@ -886,6 +891,12 @@ fn build_all(file: &File, keys: &[Key], strict: bool) -> HashMap<Key, Built> {
                         .map_err(|e| e.to_string())
                 },
             );
+            // The search for faces passing through each other takes about as long as healing a
+            // large solid, so it runs here too, outside `guarded` as it ran after the build.
+            let r = r.map(|(b, names, healed, stated)| {
+                let found = check::self_crossings(&b);
+                (b, names, healed, stated, found)
+            });
             mine.push((k, r));
         }
         mine

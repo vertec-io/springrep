@@ -2174,7 +2174,15 @@ solid never pinches.
   alone. A void with a point outside lies beside the outer shell or passes through it, as one body
   of a compound may through another, and is read as a solid of its own, however the file turns
   it, and `Import::separated` names it; its healing and tolerances are reported for that solid. A
-  strict read rejects the solid instead, naming those voids.
+  strict read rejects the solid instead, naming those voids. On a surface closed both ways (a torus,
+  a sphere) either sense of a loop bounds a region, so a bound's flag alone picks the face, and some
+  files flag a loop against the way they list it. A bound of such a face whose every edge shared
+  with a settled face runs the same way as that face's use is turned; faces on other surfaces are
+  settled as written, and a bound settles once a settled face lies across one of its edges, so the
+  sense passes from face to face. A sphere cap the read gave a seam to the pole on its loop's left
+  has, turned, the other cap on its left, so its seam is drawn to the antipode instead. The import
+  names each face turned (`Import::turned_bounds`); turning moves none of the file's geometry, only
+  a seam the read made, so a strict read does it too.
 - **Pcurves and poles.** Each loop is followed through its face's parameter plane by projection,
   each point continuing from the last. Where a loop leaves a pole any angle is possible: the one its
   next point implies is tried in each nearby period, a seam's second use must run a period from its

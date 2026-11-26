@@ -1,6 +1,8 @@
-zero-length-edge.step was written by hand for springrep's tests from the ISO 10303-42 entity
-definitions; no CAD system exported it. It is contributed under springrep's licence, MIT OR
-Apache-2.0, like the rest of the repository, and may be redistributed on those terms.
+zero-length-edge.step, torus-bound-against-its-edges.step,
+half-torus-bounds-against-their-edges.step and hemisphere-bound-against-its-edge.step were
+written by hand for springrep's tests from the ISO 10303-42 entity definitions; no CAD system
+exported them. They are contributed under springrep's licence, MIT OR Apache-2.0, like the rest
+of the repository, and may be redistributed on those terms.
 
 revolution-band.step, revolution-band-two-outer.step, revolution-band-apart.step,
 revolution-band-windows.step, revolution-band-window-on-seam.step, cylinder-band-windows.step,

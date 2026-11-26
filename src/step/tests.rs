@@ -4552,3 +4552,122 @@ fn healing_and_tolerances_of_a_void_read_as_a_solid_name_that_solid() {
         }
     }
 }
+
+/// Reads `text`, a hand-made solid of torus or sphere faces closed by discs, by default and
+/// strictly, and checks it against its closed forms: volume `volume`, area `area`, and the torus
+/// or sphere faces whose bound the read turned against the file's flag, by their STEP ids.
+fn read_turned(text: &[u8], volume: f64, area: f64, turned: &[u64]) {
+    for options in [ReadOptions::default(), ReadOptions::default().strict(true)] {
+        let imp = read_with(text, "band", &options).unwrap();
+        assert!(imp.rejected.is_empty(), "{:?}", imp.rejected);
+        assert!(imp.healed.is_empty() && imp.tolerant.is_empty());
+        let b = &imp.brep;
+        assert!(check::check(b).is_empty(), "{:?}", check::check(b));
+        assert_eq!(b.solid_ids().count(), 1);
+        assert!((measure::volume(b) - volume).abs() <= 1e-9 * volume);
+        assert!((measure::area(b) - area).abs() <= 1e-9 * area);
+        let ids: Vec<u64> = imp.turned_bounds.iter().map(|t| t.face_step_id).collect();
+        assert_eq!(ids, turned);
+        for t in &imp.turned_bounds {
+            assert_eq!((t.index, t.bounds), (0, 1));
+            assert!(matches!(
+                b.face(t.face).surface,
+                Surface::Torus(_) | Surface::Sphere(_)
+            ));
+        }
+        round_trip(b);
+    }
+}
+
+#[test]
+fn a_torus_bound_flagged_against_its_edges_takes_the_sense_its_neighbours_agree_with() {
+    // A quarter torus, R = 10 and r = 2 about Z from u = 0 to pi/2, closed by two discs. Its torus
+    // face's one loop is listed the way that bounds the quarter band, and flagged .F.: on a closed
+    // surface either sense of a loop bounds a region, the band or the rest of the torus, so the
+    // flag alone turns the face against both discs across every edge. Read the way the discs
+    // agree with, it is the band: volume (pi r^2)(R pi/2) = 20 pi^2, area a quarter of the
+    // torus's 4 pi^2 R r plus two discs, 20 pi^2 + 8 pi; the read says it turned face #52's bound.
+    let text = include_bytes!("fixtures/torus-bound-against-its-edges.step");
+    let (volume, area) = (20.0 * PI * PI, 20.0 * PI * PI + 8.0 * PI);
+    read_turned(text, volume, area, &[52]);
+    // Flagged .T., or flagged .F. over the loop listed the other way, the file means the same band
+    // as it says, and nothing is turned.
+    let text = std::str::from_utf8(text).unwrap();
+    let agreed = text.replace(
+        "#46=FACE_OUTER_BOUND('',#45,.F.)",
+        "#46=FACE_OUTER_BOUND('',#45,.T.)",
+    );
+    read_turned(agreed.as_bytes(), volume, area, &[]);
+    let listed_back = text
+        .replace(
+            "#41=ORIENTED_EDGE('',*,*,#10,.T.)",
+            "#41=ORIENTED_EDGE('',*,*,#10,.F.)",
+        )
+        .replace(
+            "#42=ORIENTED_EDGE('',*,*,#22,.T.)",
+            "#42=ORIENTED_EDGE('',*,*,#22,.F.)",
+        )
+        .replace(
+            "#43=ORIENTED_EDGE('',*,*,#16,.F.)",
+            "#43=ORIENTED_EDGE('',*,*,#16,.T.)",
+        )
+        .replace(
+            "#44=ORIENTED_EDGE('',*,*,#22,.F.)",
+            "#44=ORIENTED_EDGE('',*,*,#22,.T.)",
+        )
+        .replace("(#41,#42,#43,#44)", "(#44,#43,#42,#41)");
+    assert_ne!(listed_back, text);
+    read_turned(listed_back.as_bytes(), volume, area, &[]);
+}
+
+#[test]
+fn torus_bounds_flagged_against_their_edges_take_their_sense_from_face_to_face() {
+    // A half torus, R = 10 and r = 2 about Z from u = 0 to pi, in three torus faces of pi/3 each,
+    // closed by two discs, each torus bound flagged .F. over a loop listed its band's way. The
+    // middle face touches only the other two, so its sense follows theirs once the discs have set
+    // them. Volume (pi r^2)(R pi) = 40 pi^2, area 40 pi^2 + 8 pi; the read turned all three, faces #80, #87 and #94.
+    let text = include_bytes!("fixtures/half-torus-bounds-against-their-edges.step");
+    let (volume, area) = (40.0 * PI * PI, 40.0 * PI * PI + 8.0 * PI);
+    read_turned(text, volume, area, &[80, 87, 94]);
+}
+
+#[test]
+fn a_sphere_cap_flagged_against_its_edge_takes_its_pole_from_its_neighbour() {
+    // The upper half of a ball of radius r = 5 at the origin, closed by the disc at z = 0. The
+    // sphere face's one loop, the equator, is listed anticlockwise about +Z, the way that bounds
+    // the upper half, and flagged .F.: on a sphere either sense of a loop bounds a cap, so the flag
+    // alone puts the face on the lower half, against the disc. Read the way the disc agrees with,
+    // it is the upper half, over the pole at +Z: volume 2 pi r^3 / 3 = 250 pi / 3, area
+    // 2 pi r^2 + pi r^2 = 75 pi; the read says it turned face #18's bound.
+    let text = include_bytes!("fixtures/hemisphere-bound-against-its-edge.step");
+    let (volume, area) = (250.0 * PI / 3.0, 75.0 * PI);
+    read_turned(text, volume, area, &[18]);
+    let text = std::str::from_utf8(text).unwrap();
+    // Flagged .T., the file means the same half as it says, and nothing is turned.
+    let agreed = text.replace(
+        "#16=FACE_OUTER_BOUND('',#15,.F.)",
+        "#16=FACE_OUTER_BOUND('',#15,.T.)",
+    );
+    read_turned(agreed.as_bytes(), volume, area, &[]);
+    // On a sphere whose axis lies in the disc's plane, the equator runs through the sphere's own
+    // poles and is read as a latitude about its circle's normal: the same half, and turned.
+    let tilted = text.replace(
+        "#17=SPHERICAL_SURFACE('',#6,5.0);",
+        "#17=SPHERICAL_SURFACE('',#37,5.0);\n#37=AXIS2_PLACEMENT_3D('',#3,#5,#38);\n\
+         #38=DIRECTION('',(0.0,1.0,0.0));",
+    );
+    assert_ne!(tilted, text);
+    read_turned(tilted.as_bytes(), volume, area, &[18]);
+    // With the disc turned to close the lower half, the flag agrees with it: the lower half, of
+    // the same volume and area, read as written.
+    let lower = text
+        .replace(
+            "#9=ORIENTED_EDGE('',*,*,#8,.F.)",
+            "#9=ORIENTED_EDGE('',*,*,#8,.T.)",
+        )
+        .replace(
+            "#13=ADVANCED_FACE('',(#11),#12,.F.)",
+            "#13=ADVANCED_FACE('',(#11),#12,.T.)",
+        );
+    read_turned(lower.as_bytes(), volume, area, &[]);
+}

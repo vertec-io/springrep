@@ -28,8 +28,9 @@ pub struct ReadOptions {
     /// heal, keep with local tolerances, or keep while it passes through itself is rejected
     /// instead, with the reason: so `healed` and `tolerant` stay empty, every solid kept is the
     /// file's own geometry, and `crossed` holds only places where a solid touches itself. Coincident
-    /// vertices and edges are still joined, a shell written inside out is still turned, and units
-    /// and placements still apply: none of those moves geometry.
+    /// vertices and edges are still joined, a shell written inside out is still turned, a bound
+    /// flagged against the faces round it is still turned ([`TurnedBound`]), and units and
+    /// placements still apply: none of those moves geometry.
     pub strict: bool,
 }
 
@@ -65,6 +66,10 @@ pub struct Import {
     /// One entry per placed solid written with voids outside its outer shell, each of which was
     /// read as a solid of its own, in placement order. A strict read rejects such a solid instead.
     pub separated: Vec<Separated>,
+    /// One entry per face of a placed solid whose bounds the read takes in the sense the faces
+    /// across their edges agree with rather than the sense the file's flags give them, in
+    /// placement order. A strict read turns them too: turning a bound moves no geometry.
+    pub turned_bounds: Vec<TurnedBound>,
     /// One entry per solid of `brep`, in its order: what the file calls it and how it draws it.
     pub bodies: Vec<Body>,
     /// The faces the file gives a colour of their own, apart from their body's.
@@ -117,6 +122,26 @@ pub struct Separated {
     pub step_id: u64,
     /// The shells read as solids of their own, by the instances the solid lists them as.
     pub shells: Vec<u64>,
+}
+
+/// A face whose bounds the read turned against the file's flags. On a surface closed in both
+/// directions, such as a torus or a sphere, either sense of a loop bounds a region of it, so a
+/// `FACE_BOUND`'s orientation flag alone picks which one the face is (ISO 10303-42, `face_bound`).
+/// Where the flag turns a loop the same way as the faces across every one of its shared edges,
+/// so that the shell would not close, the read takes the sense those faces agree with.
+#[derive(Clone, Debug, PartialEq)]
+#[non_exhaustive]
+pub struct TurnedBound {
+    /// The solid's position among `Import::brep`'s solids.
+    pub index: usize,
+    /// The solid's STEP instance.
+    pub step_id: u64,
+    /// The face, in `Import::brep`.
+    pub face: FaceId,
+    /// The face's STEP instance.
+    pub face_step_id: u64,
+    /// How many of the face's bounds were turned.
+    pub bounds: usize,
 }
 
 /// A placed solid whose geometry could not be healed to meet within [`crate::tol::LINEAR`]
@@ -597,6 +622,7 @@ pub fn read_with(text: &[u8], feature: &str, options: &ReadOptions) -> Result<Im
     let mut tolerant = Vec::new();
     let mut crossed = Vec::new();
     let mut separated = Vec::new();
+    let mut turned_bounds = Vec::new();
     let mut crossings: HashMap<Key, Vec<check::SelfCrossing>> = HashMap::new();
     let mut counter = 0usize;
     let mut index = 0usize;
@@ -606,7 +632,7 @@ pub fn read_with(text: &[u8], feature: &str, options: &ReadOptions) -> Result<Im
     for pl in placements {
         match &built[&pl.key()] {
             Err(e) => rejected.push(format!("#{}: {e}", pl.solid)),
-            Ok((b, names, heal, stated, apart)) => {
+            Ok((b, names, heal, stated, apart, turned)) => {
                 let found = crossings
                     .entry(pl.key())
                     .or_insert_with(|| check::self_crossings(b))
@@ -703,6 +729,18 @@ pub fn read_with(text: &[u8], feature: &str, options: &ReadOptions) -> Result<Im
                     instance: pl.uses.iter().map(|&u| use_name(&file, u)).collect(),
                     colour: colours.get(&pl.solid).copied(),
                 }));
+                for &(k, bounds) in turned {
+                    // A solid read with voids outside it as solids of their own is several.
+                    let within = b.face_ids().nth(k).and_then(|f| b.face(f).shell);
+                    let within = within.and_then(|sh| b.shell(sh).solid);
+                    turned_bounds.push(TurnedBound {
+                        index: solid_index + within.map_or(0, |s| s.index()),
+                        step_id: pl.solid,
+                        face: ids[k],
+                        face_step_id: names[k].0,
+                        bounds,
+                    });
+                }
                 for x in found {
                     // A solid read with voids outside it as solids of their own is several.
                     let within = b.face(x.a).shell.and_then(|sh| b.shell(sh).solid);
@@ -724,6 +762,7 @@ pub fn read_with(text: &[u8], feature: &str, options: &ReadOptions) -> Result<Im
         tolerant,
         crossed,
         separated,
+        turned_bounds,
         bodies,
         face_colours,
     })
@@ -837,8 +876,9 @@ fn colours(file: &File) -> HashMap<u64, [f64; 3]> {
 }
 
 /// A solid, its faces' ids and names, how far healing moved each of its solids it moved, by the
-/// solid's position, the uncertainty its file states, and the void shells outside its outer shell
-/// read as solids of their own.
+/// solid's position, the uncertainty its file states, the void shells outside its outer shell
+/// read as solids of their own, and the faces whose bounds the read turned, as
+/// [`topology::ReadSolid`].
 type Built = std::result::Result<
     (
         Brep,
@@ -846,6 +886,7 @@ type Built = std::result::Result<
         Vec<(usize, Healed)>,
         Option<f64>,
         Vec<u64>,
+        Vec<(usize, usize)>,
     ),
     String,
 >;
@@ -964,8 +1005,8 @@ fn build_all(file: &File, keys: &[Key], strict: bool) -> HashMap<Key, Built> {
                 |geo| {
                     geo.use_scaled(context, f64::from_bits(scale))
                         .and_then(|_| topology::solid(geo, solid, strict))
-                        .map(|(b, names, healed, apart)| {
-                            (b, names, healed, geo.uncertainty(), apart)
+                        .map(|(b, names, healed, apart, turned)| {
+                            (b, names, healed, geo.uncertainty(), apart, turned)
                         })
                         .map_err(|e| e.to_string())
                 },

@@ -1767,19 +1767,26 @@ fn shift_into(s: &Surface, tracks: &mut [Track], lo: Vec2, hi: Vec2) {
 }
 
 /// A solid read, its faces' STEP ids and names in order, how far healing moved the geometry of
-/// each of its solids it moved, by the solid's position, and the instances of the void shells that
+/// each of its solids it moved, by the solid's position, the instances of the void shells that
 /// lie outside its outer shell and were read as solids of their own, in the order the solids follow
-/// the first.
+/// the first, and the faces whose bounds it read against the file's flags ([`agree_senses`]): each
+/// face's position among its faces and how many of its bounds.
 pub(super) type ReadSolid = (
     Brep,
     Vec<(u64, String)>,
     Vec<(usize, heal::Healed)>,
     Vec<u64>,
+    Vec<(usize, usize)>,
 );
 
-/// A solid read from some of a solid's shells, its faces' STEP ids and names in order, and how far
-/// healing moved its geometry.
-type Shells = (Brep, Vec<(u64, String)>, Option<heal::Healed>);
+/// A solid read from some of a solid's shells, its faces' STEP ids and names in order, how far
+/// healing moved its geometry, and the faces whose bounds it read against the file's flags.
+type Shells = (
+    Brep,
+    Vec<(u64, String)>,
+    Option<heal::Healed>,
+    Vec<(usize, usize)>,
+);
 
 /// The larger of two movements.
 fn farther(a: Option<heal::Healed>, b: Option<heal::Healed>) -> Option<heal::Healed> {
@@ -1869,6 +1876,145 @@ fn own_nappes(mut raw: Raw) -> Result<Raw> {
     Ok(raw)
 }
 
+/// Whether either sense of a loop on `s` bounds a region of it, as on a surface closed in both
+/// directions: a torus, or a sphere, closed round its axis and at its poles.
+fn closed_both_ways(s: &Surface) -> bool {
+    matches!(s, Surface::Sphere(_)) || (s.u_period().is_some() && s.v_period().is_some())
+}
+
+/// Moves the cap seam of bound `k` of face `f`, just turned, to the other pole. A sphere face
+/// with one loop round its axis and no seam is read as the cap on the loop's left, given a
+/// meridian up to that cap's pole and back ([`Reader::capped`]); turned, the loop has the other
+/// cap on its left, so the meridian must run to the antipode instead. The seam is told from a
+/// `VERTEX_LOOP`'s, whose pole is the file's vertex and stays, by its pole: a point the read made
+/// for the face, which no other edge uses. The bound is rotated so the seam's two uses close it,
+/// as the read lays them. Nothing else changes: other bounds and surfaces have no seam of the read's.
+fn recap(raw: &mut Raw, f: usize, k: usize) {
+    let Surface::Sphere(s) = &raw.faces[f].surface else {
+        return;
+    };
+    let (c, z) = (s.frame.origin, s.frame.z);
+    let bound = &raw.faces[f].bounds[k].1;
+    let Some(i) = (0..bound.len()).find(|&i| {
+        let e = bound[i].edge;
+        let pole = raw.edges[e].end;
+        bound.iter().filter(|u| u.edge == e).count() == 2
+            && raw.vertex_ids[pole] == raw.faces[f].id
+            && (raw.points[pole] - c).cross(z).norm() <= tol::LINEAR
+            && raw
+                .edges
+                .iter()
+                .enumerate()
+                .all(|(j, x)| j == e || (x.start != pole && x.end != pole))
+    }) else {
+        return;
+    };
+    let e = bound[i].edge;
+    let (from, pole) = (raw.edges[e].start, raw.edges[e].end);
+    let q = c * 2.0 - raw.points[pole];
+    // A meridian from the loop's vertex to the new pole, as `Reader::seam` draws one.
+    let x = raw.points[from] - c;
+    let y = (q - c) - x.unit_or_zero() * (q - c).dot(x.unit_or_zero());
+    let Ok(frame) = Frame::new(c, x.cross(y), x) else {
+        return;
+    };
+    let radius = s.radius;
+    raw.points[pole] = q;
+    raw.edges[e].curve = Curve::Circle(Circle { frame, radius });
+    // The seam's uses go last: out along it from `from`, and back.
+    let bound = &mut raw.faces[f].bounds[k].1;
+    if let Some(j) = bound.iter().position(|u| u.edge == e && !u.reversed)
+        && bound[(j + 1) % bound.len()].edge == e
+    {
+        let n = bound.len();
+        bound.rotate_left((j + 2) % n);
+    }
+}
+
+/// Takes each bound of a face on a surface closed both ways in the sense the faces across its
+/// edges agree with. On such a surface both senses of a loop bound a region of it, the face or the
+/// rest of the surface, so the `FACE_BOUND` flag alone says which the face is, and some files flag
+/// a loop against the way they list it. In a closed shell the two uses of an edge run opposite
+/// ways; where every use of a bound with a face across it runs the same way as that face's, the
+/// bound is turned. A bound settles once it has a settled face across one of its edges, every
+/// bound of any other face being settled as written, so the sense passes from face to face.
+/// Returns each face with bounds turned and how many.
+fn agree_senses(raw: &mut Raw) -> Vec<(usize, usize)> {
+    let mut settled: Vec<Vec<bool>> = raw
+        .faces
+        .iter()
+        .map(|f| vec![!closed_both_ways(&f.surface); f.bounds.len()])
+        .collect();
+    if settled.iter().flatten().all(|&s| s) {
+        return Vec::new();
+    }
+    // Each edge's uses: the face, its bound and whether the use runs against the edge.
+    let mut uses: Vec<Vec<(usize, usize, bool)>> = vec![Vec::new(); raw.edges.len()];
+    for (f, face) in raw.faces.iter().enumerate() {
+        for (k, (_, bound)) in face.bounds.iter().enumerate() {
+            for u in bound {
+                uses[u.edge].push((f, k, u.reversed));
+            }
+        }
+    }
+    let mut turned = vec![0; raw.faces.len()];
+    let mut changed = true;
+    while changed {
+        changed = false;
+        for f in 0..raw.faces.len() {
+            for k in 0..raw.faces[f].bounds.len() {
+                if settled[f][k] {
+                    continue;
+                }
+                let (mut with, mut against) = (0, 0);
+                for u in &raw.faces[f].bounds[k].1 {
+                    // Only an edge two faces use has a face across it to agree with.
+                    let &[a, b] = &uses[u.edge][..] else {
+                        continue;
+                    };
+                    let (mine, other) = if (a.0, a.1) == (f, k) { (a, b) } else { (b, a) };
+                    if (other.0, other.1) == (f, k) || !settled[other.0][other.1] {
+                        continue;
+                    }
+                    if mine.2 == other.2 {
+                        against += 1;
+                    } else {
+                        with += 1;
+                    }
+                }
+                if with + against == 0 {
+                    continue;
+                }
+                settled[f][k] = true;
+                changed = true;
+                if with > 0 {
+                    continue;
+                }
+                let bound = &mut raw.faces[f].bounds[k].1;
+                bound.reverse();
+                for u in bound.iter_mut() {
+                    u.reversed = !u.reversed;
+                }
+                let mut edges: Vec<usize> = bound.iter().map(|u| u.edge).collect();
+                edges.sort_unstable();
+                edges.dedup();
+                for e in edges {
+                    for x in uses[e].iter_mut().filter(|x| (x.0, x.1) == (f, k)) {
+                        x.2 = !x.2;
+                    }
+                }
+                recap(raw, f, k);
+                turned[f] += 1;
+            }
+        }
+    }
+    turned
+        .into_iter()
+        .enumerate()
+        .filter(|&(_, n)| n > 0)
+        .collect()
+}
+
 /// Builds the solid of a `MANIFOLD_SOLID_BREP` or `BREP_WITH_VOIDS`, healed where its geometry
 /// disagrees with itself, and checked. Returns the solid, its faces' STEP ids and names in order,
 /// how far healing moved the geometry of each solid read, and the void shells read as solids of
@@ -1889,7 +2035,7 @@ pub(super) fn solid(geo: &mut Geometry, id: u64, strict: bool) -> Result<ReadSol
     {
         return tessellated(geo, id).map(|b| {
             let names = vec![(0, String::new()); b.face_count()];
-            (b, names, Vec::new(), Vec::new())
+            (b, names, Vec::new(), Vec::new(), Vec::new())
         });
     }
     let mut rd = Reader {
@@ -1908,7 +2054,8 @@ pub(super) fn solid(geo: &mut Geometry, id: u64, strict: bool) -> Result<ReadSol
     let read = |raw: Raw| built(raw, uncertainty, ours, strict);
     let first = |healed: Option<heal::Healed>| healed.map(|h| (0, h)).into_iter().collect();
     if raw.shells.len() == 1 {
-        return read(raw).map(|(b, names, healed)| (b, names, first(healed), Vec::new()));
+        return read(raw)
+            .map(|(b, names, healed, turned)| (b, names, first(healed), Vec::new(), turned));
     }
     // A void lies inside the outer shell, so one with a point outside it, beyond the tolerance, is
     // no void: it lies beside the outer shell, touching it or not, or passes through it, as one
@@ -1924,7 +2071,7 @@ pub(super) fn solid(geo: &mut Geometry, id: u64, strict: bool) -> Result<ReadSol
             .collect()
     };
     let outside = match &whole {
-        Ok((b, names, _)) => {
+        Ok((b, names, _, _)) => {
             let ids: HashSet<u64> = raw.shells[0].iter().map(|&f| raw.faces[f].id).collect();
             let faces: Vec<FaceId> = b
                 .face_ids()
@@ -1934,13 +2081,14 @@ pub(super) fn solid(geo: &mut Geometry, id: u64, strict: bool) -> Result<ReadSol
         }
         Err(_) => {
             outer = read(shells_of(&raw, &[0])).ok();
-            outer.as_ref().map_or_else(Vec::new, |(b, _, _)| {
+            outer.as_ref().map_or_else(Vec::new, |(b, _, _, _)| {
                 against(b, &b.face_ids().collect::<Vec<_>>())
             })
         }
     };
     if outside.is_empty() {
-        return whole.map(|(b, names, healed)| (b, names, first(healed), Vec::new()));
+        return whole
+            .map(|(b, names, healed, turned)| (b, names, first(healed), Vec::new(), turned));
     }
     let named: Vec<String> = outside.iter().map(|&k| format!("#{}", listed[k])).collect();
     if strict {
@@ -1955,19 +2103,21 @@ pub(super) fn solid(geo: &mut Geometry, id: u64, strict: bool) -> Result<ReadSol
     let kept: Vec<usize> = (0..raw.shells.len())
         .filter(|k| !outside.contains(k))
         .collect();
-    let (mut b, mut names, healed) = match outer {
+    let (mut b, mut names, healed, mut turned) = match outer {
         Some(outer) if kept.len() == 1 => outer,
         _ => read(shells_of(&raw, &kept))?,
     };
     let mut healed: Vec<(usize, heal::Healed)> = first(healed);
     for (&k, name) in outside.iter().zip(&named) {
-        let (part, more, moved) = read(shells_of(&raw, &[k])).map_err(|e| {
+        let (part, more, moved, also) = read(shells_of(&raw, &[k])).map_err(|e| {
             Error::InvalidInput(format!(
                 "void shell {name} lies outside the outer shell, and read as a solid of its own: \
                  {e}"
             ))
         })?;
         healed.extend(moved.map(|h| (b.solid_ids().count(), h)));
+        // The part's faces follow those read before it.
+        turned.extend(also.into_iter().map(|(f, n)| (names.len() + f, n)));
         b.append(&part);
         names.extend(more);
     }
@@ -1976,6 +2126,7 @@ pub(super) fn solid(geo: &mut Geometry, id: u64, strict: bool) -> Result<ReadSol
         names,
         healed,
         outside.iter().map(|&k| listed[k]).collect(),
+        turned,
     ))
 }
 
@@ -2065,7 +2216,8 @@ fn shell_points(raw: &Raw, k: usize) -> Vec<Point3> {
 /// names and how far healing moved it; `uncertainty` is the one its file states, and `ours`
 /// whether this kernel wrote the file.
 fn built(raw: Raw, uncertainty: Option<f64>, ours: bool, strict: bool) -> Result<Shells> {
-    let file = own_nappes(join_contacts(raw))?;
+    let mut file = own_nappes(join_contacts(raw))?;
+    let turned = agree_senses(&mut file);
     let names = || file.faces.iter().map(|f| (f.id, f.name.clone())).collect();
     if strict {
         if let Some(why) = heal::misfit(&file) {
@@ -2076,7 +2228,7 @@ fn built(raw: Raw, uncertainty: Option<f64>, ours: bool, strict: bool) -> Result
         // A file that agrees with itself is left exactly as it is.
         let mut raw = file.clone();
         let (ranges, _) = heal::heal(&mut raw)?;
-        return assemble(&raw, &ranges, None).map(|b| (b, names(), None));
+        return assemble(&raw, &ranges, None).map(|b| (b, names(), None, turned));
     }
     let exact = || {
         let mut raw = file.clone();
@@ -2097,7 +2249,7 @@ fn built(raw: Raw, uncertainty: Option<f64>, ours: bool, strict: bool) -> Result
             Ok((b, healed))
                 if within.is_none_or(|w| healed.as_ref().is_none_or(|h| h.moved <= w)) =>
             {
-                return Ok((b, names(), healed));
+                return Ok((b, names(), healed, turned));
             }
             why => Some(why),
         }
@@ -2116,11 +2268,11 @@ fn built(raw: Raw, uncertainty: Option<f64>, ours: bool, strict: bool) -> Result
             })
     };
     let t = match tolerant(&file) {
-        Ok((b, moved)) => return Ok((b, names(), moved)),
+        Ok((b, moved)) => return Ok((b, names(), moved, turned)),
         Err(t) => t,
     };
     match why.unwrap_or_else(exact) {
-        Ok((b, healed)) => Ok((b, names(), healed)),
+        Ok((b, healed)) => Ok((b, names(), healed, turned)),
         Err(e) => {
             // Healed where it can be, and held by tolerances where it cannot.
             let mut loose = file.clone();
@@ -2130,7 +2282,9 @@ fn built(raw: Raw, uncertainty: Option<f64>, ours: bool, strict: bool) -> Result
                     "healing would move {} {:.1e} mm, more than the file's {within:.1e} mm",
                     h.what, h.moved
                 ),
-                (Ok((b, moved)), _, _) => return Ok((b, names(), farther(healed, moved))),
+                (Ok((b, moved)), _, _) => {
+                    return Ok((b, names(), farther(healed, moved), turned));
+                }
                 (Err(l), _, _) => l,
             };
             Err(Error::InvalidInput(format!(

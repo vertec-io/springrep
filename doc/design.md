@@ -2212,7 +2212,15 @@ solid never pinches.
      still misses is refitted through its vertices onto both its faces' surfaces. A refit follows
      the file's curve bent to the moved vertices, so where two faces touch it stays on the line of
      the vertices rather than a second line beside it; a refit that stays on both faces everywhere
-     is kept as its spline, otherwise as an intersection curve.
+     is kept as its spline, otherwise as an intersection curve. In a file that states an
+     uncertainty, faces that touch at a vertex or along an edge (normals within a sine of 0.1) are
+     held rather than closed, since they fix a point only along their common normal: the vertex
+     moves to the least move from the file's that meets the middle of each stack of touching sheets
+     (the minimum-norm solution of at most three equations), each of its edges ends on its own two
+     faces as near it as they meet, and an edge along touching faces is the curve midway between
+     them. Each carries 1.5 times its widest gap, within the stated uncertainty, `MAX_HEAL` and a
+     quarter of its shortest edge; the surfaces stay as the file has them. A file that states no
+     uncertainty holds nothing.
   2. Where faces miss each other, so that step fails (three surfaces with no common point at a
      vertex, two faces that touch rather than cross, a B-spline face that stops short of its
      corner), the surfaces of the faces involved move too ([`adjust.rs`](../src/step/adjust.rs)).

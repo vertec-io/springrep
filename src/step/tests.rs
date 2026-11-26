@@ -4878,3 +4878,89 @@ fn a_torus_bound_turned_in_a_void_read_as_a_solid_of_its_own_is_reported_at_that
         );
     }
 }
+
+/// The rounded block with its round grown by `dr`, in a file that states `stated` as its
+/// uncertainty, or states none.
+fn rounds_grown(dr: f64, stated: Option<f64>) -> super::Import {
+    let text = with_rounds_grown(&rounded_block(), dr);
+    let text = match stated {
+        Some(u) => with_uncertainty(&text, u),
+        None => text,
+    };
+    read(text.as_bytes(), "imp").unwrap()
+}
+
+/// Grown by `dr`, the round lies `dr` off the two sides it is tangent to along its two lines, and
+/// at each of its four corners, where an end of the block crosses it: sheets that touch, which no
+/// point or curve within the kernel tolerance of both can join once `dr` passes half of it. In a
+/// file that states an uncertainty above `dr`, they are held, and no surface moves: each of the
+/// round's lines is the curve midway between its faces, `dr/2` from each, and each corner the
+/// point midway between the sheets on the end, `dr/2` from each, its edges ending on their own
+/// faces. Each carries 1.5 times its gap, `0.75 dr`, as a kept solid's tolerances are widened;
+/// for `dr = 1e-7` that is within the kernel tolerance, and the solid is exact. Every face lies
+/// within `dr` of the block's, so the volume is within `A dr` of the block's,
+/// `V₀ = 3 (60 − (1 − π/4))`, `A` its area.
+#[test]
+fn touching_faces_within_the_files_uncertainty_are_held_rather_than_moved() {
+    let b = rounded_block();
+    let (v0, a) = (measure::volume(&b), measure::area(&b));
+    assert!((v0 - 3.0 * (60.0 - (1.0 - PI / 4.0))).abs() < 1e-9);
+    for (dr, stated) in [
+        (1e-7, 1e-6),
+        (3e-7, 1e-6),
+        (5e-7, 1e-6),
+        (2e-6, 1e-5),
+        (5e-6, 1e-5),
+    ] {
+        let imp = rounds_grown(dr, Some(stated));
+        assert!(imp.rejected.is_empty(), "{dr}: {:?}", imp.rejected);
+        assert!(check::check(&imp.brep).is_empty(), "{dr}");
+        assert_eq!(imp.healed.len(), 1, "{dr}");
+        let h = &imp.healed[0];
+        assert!(h.surfaces == 0.0 && h.moved <= 1.001 * dr, "{dr}: {h:?}");
+        if 0.75 * dr <= crate::tol::LINEAR {
+            assert!(imp.tolerant.is_empty(), "{dr}: {:?}", imp.tolerant);
+        } else {
+            let t = &imp.tolerant[0];
+            assert_eq!(
+                (t.vertices, t.edges, t.past_stated),
+                (4, 2, 0),
+                "{dr}: {t:?}"
+            );
+            assert!((t.largest - 0.75 * dr).abs() <= 1e-13, "{dr}: {t:?}");
+        }
+        let v = measure::volume(&imp.brep);
+        assert!((v - v0).abs() <= a * dr, "{dr}: {v} vs {v0}");
+    }
+}
+
+/// A file that states no uncertainty is healed as before: the surface step moves the round onto
+/// the sides it touches, and the solid is exact, within `A dr` of the block's volume.
+#[test]
+fn touching_faces_in_a_file_that_states_no_uncertainty_are_closed_by_moving_a_surface() {
+    let b = rounded_block();
+    let (v0, a) = (measure::volume(&b), measure::area(&b));
+    for dr in [1e-7, 3e-7, 2e-6, 5e-6] {
+        let imp = rounds_grown(dr, None);
+        assert!(imp.rejected.is_empty(), "{dr}: {:?}", imp.rejected);
+        assert!(check::check(&imp.brep).is_empty(), "{dr}");
+        assert!(imp.tolerant.is_empty(), "{dr}: {:?}", imp.tolerant);
+        let h = &imp.healed[0];
+        assert!(h.surfaces > 0.0 && h.surfaces <= dr, "{dr}: {h:?}");
+        let v = measure::volume(&imp.brep);
+        assert!((v - v0).abs() <= a * dr, "{dr}: {v} vs {v0}");
+    }
+}
+
+/// Grown 5e-6 in a file that states 1e-6, the round's corners are 2.5e-6 from the sheets they
+/// would be held between, more than the file says its geometry is off, so nothing is held, and
+/// the file's geometry is kept with tolerances of 1.5 times the 5e-6 gap, as before.
+#[test]
+fn touching_faces_further_apart_than_the_file_states_are_kept_as_it_has_them() {
+    let imp = rounds_grown(5e-6, Some(1e-6));
+    assert!(imp.rejected.is_empty(), "{:?}", imp.rejected);
+    assert!(check::check(&imp.brep).is_empty());
+    let t = &imp.tolerant[0];
+    assert_eq!((t.vertices, t.edges, t.past_stated), (4, 4, 8));
+    assert!((t.largest - 7.5e-6).abs() < 1e-8, "{t:?}");
+}

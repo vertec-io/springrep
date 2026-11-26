@@ -18,7 +18,7 @@ use super::topology::{Raw, edge_range, param_of};
 use crate::{
     Error, Result,
     geom::{BSpline, Curve, IntersectionCurve, Surface, refine_onto_both},
-    math::{Point3, Vec3},
+    math::{Point3, Vec2, Vec3},
     numeric::solve_dense,
     tol,
 };
@@ -106,9 +106,18 @@ const MEET_REACH: f64 = 0.05;
 /// damped Gauss–Newton on the distances; `None` if they do not meet within `reach` of `p0`
 /// (by default, a few times the distance `p0` misses them by).
 fn solve_vertex(p0: Point3, on: &[On], reach: Option<f64>) -> Option<Point3> {
+    let (x, worst, reach, solved) = nearest_meeting(p0, on, reach);
+    (solved && worst <= 0.25 * tol::LINEAR && x.dist(p0) <= reach).then_some(x)
+}
+
+/// The point [`solve_vertex`] finds, whether or not it is near enough: the point of its search
+/// within `reach` of `p0` nearest all of `on`, how far it lies from the farthest of them, the
+/// reach, and false where a step could not be solved for, which ends the search.
+fn nearest_meeting(p0: Point3, on: &[On], reach: Option<f64>) -> (Point3, f64, f64, bool) {
     let mut x = p0;
     let mut reach = reach;
     let mut best = (f64::INFINITY, p0);
+    let mut solved = true;
     for _ in 0..100 {
         let mut rows: Vec<(Vec3, f64)> = Vec::new();
         for c in on {
@@ -167,12 +176,18 @@ fn solve_vertex(p0: Point3, on: &[On], reach: Option<f64>) -> Option<Point3> {
             for i in 0..3 {
                 ad[i * 3 + i] += damp;
             }
-            let st = solve_dense(ad, b.clone(), 3, 1).ok()?;
+            let Ok(st) = solve_dense(ad, b.clone(), 3, 1) else {
+                break None;
+            };
             let st = Vec3::new(st[0], st[1], st[2]);
             if (x + st).dist(p0) <= reach || damp > trace {
-                break st;
+                break Some(st);
             }
             damp *= 100.0;
+        };
+        let Some(step) = step else {
+            solved = false;
+            break;
         };
         if (x + step).dist(p0) > reach {
             break;
@@ -191,7 +206,74 @@ fn solve_vertex(p0: Point3, on: &[On], reach: Option<f64>) -> Option<Point3> {
             On::Plane(o, n) => n.dot(x - *o).abs(),
         })
         .fold(0.0, f64::max);
-    (worst <= 0.25 * tol::LINEAR && x.dist(p0) <= reach.unwrap_or(0.0)).then_some(x)
+    (x, worst, reach.unwrap_or(0.0), solved)
+}
+
+/// Below this sine of the angle between two faces' normals at a vertex they touch there rather
+/// than cross, as [`adjust`] has it.
+const TOUCHING: f64 = 0.1;
+
+/// The point the surfaces `on` fix near `p0`, and how far it lies from the farthest of them, where
+/// some of them touch there. Surfaces whose normals agree within [`TOUCHING`] are a stack of nearly
+/// parallel sheets: to first order they fix the point only along their common normal, where the
+/// point nearest the farthest of them lies midway between the outermost two (the centre of an
+/// interval, which minimises the largest distance). Stacks that cross fix it along each of their
+/// normals; the point is the least move from `p0` that meets every stack's middle, the
+/// minimum-norm solution of at most three equations in three unknowns. More than three stacks
+/// overdetermine the point, which is then no such point: those faces cross and miss.
+fn touching_centre(p0: Point3, on: &[&Surface]) -> Option<(Point3, f64)> {
+    let mut x = p0;
+    let mut hints: Vec<Vec2> = on.iter().map(|s| s.project(x)).collect();
+    let mut touching = false;
+    for _ in 0..16 {
+        // Each stack's unit normal and the least and greatest signed offset of `x` from its sheets.
+        let mut stacks: Vec<(Vec3, f64, f64)> = Vec::new();
+        for (s, h) in on.iter().zip(hints.iter_mut()) {
+            *h = s.project_near(x, *h);
+            let q = s.eval(h.x, h.y);
+            let n = s.normal(h.x, h.y);
+            if n.norm() < 0.5 {
+                return None;
+            }
+            match stacks.iter_mut().find(|g| g.0.cross(n).norm() < TOUCHING) {
+                Some(g) => {
+                    let n = if g.0.dot(n) < 0.0 { -n } else { n };
+                    let o = n.dot(x - q);
+                    g.1 = g.1.min(o);
+                    g.2 = g.2.max(o);
+                    touching = true;
+                }
+                None => {
+                    let o = n.dot(x - q);
+                    stacks.push((n, o, o));
+                }
+            }
+        }
+        let m = stacks.len();
+        if m > 3 {
+            return None;
+        }
+        // δ = Nᵀ (N Nᵀ)⁻¹ c, with N the stacks' normals and c the moves onto their middles.
+        let mut a = vec![0.0; m * m];
+        let mut c = vec![0.0; m];
+        for i in 0..m {
+            for j in 0..m {
+                a[i * m + j] = stacks[i].0.dot(stacks[j].0);
+            }
+            c[i] = -0.5 * (stacks[i].1 + stacks[i].2);
+        }
+        let y = solve_dense(a, c, m, 1).ok()?;
+        let step = (0..m).fold(Vec3::ZERO, |d, i| d + stacks[i].0 * y[i]);
+        x += step;
+        if step.norm() <= 1e-3 * tol::LINEAR {
+            break;
+        }
+    }
+    if !touching {
+        return None;
+    }
+    let worst = on.iter().map(|s| surface_gap(s, x)).fold(0.0, f64::max);
+    Some((x, worst))
 }
 
 /// The most points a refit puts through an edge before it gives up on the faces meeting along one
@@ -254,6 +336,7 @@ fn refit(
     e: usize,
     range: Option<(f64, f64)>,
     samples: Option<&Vec<Point3>>,
+    (held, reach): (&[bool], f64),
 ) -> std::result::Result<(Curve, (f64, f64)), String> {
     let edge = &raw.edges[e];
     let mut faces = edge.faces.clone();
@@ -264,8 +347,29 @@ fn refit(
     let (a, b) = (&raw.faces[faces[0]].surface, &raw.faces[faces[1]].surface);
     let same = faces[0] == faces[1];
     let closed = edge.start == edge.end;
-    let (ps, pe) = (raw.points[edge.start], raw.points[edge.end]);
+    let (mut ps, mut pe) = (raw.points[edge.start], raw.points[edge.end]);
     let c = &edge.curve;
+    // At a held vertex the edge ends on its own two faces, as near the vertex as they meet, within
+    // `reach` of it: the vertex's tolerance, found after, must hold that end.
+    let end_on = |p: Point3| {
+        if same {
+            return p;
+        }
+        touching_centre(p, &[a, b])
+            .filter(|&(x, g)| g <= 0.25 * tol::LINEAR && x.dist(p) <= reach)
+            .map(|(x, _)| x)
+            .or_else(|| {
+                let along = c.d1(param_of(c, p)).1;
+                onto_both(a, b, false, p, along).filter(|x| x.dist(p) <= reach)
+            })
+            .unwrap_or(p)
+    };
+    if held[edge.start] {
+        ps = end_on(ps);
+    }
+    if held[edge.end] {
+        pe = if closed { ps } else { end_on(pe) };
+    }
     let r = match range {
         Some(r) => r,
         None => {
@@ -460,11 +564,16 @@ fn range_of(raw: &Raw, e: usize) -> Option<(f64, f64)> {
 /// Moves each vertex that misses its faces onto them, starting from `start` where given, and
 /// refits each edge that still misses. Returns each edge's range, or every vertex and edge that
 /// would not fit. `loose` refits the edges at a vertex that would not move too, from where it is.
+/// `hold`, the file's stated uncertainty, is how far apart a vertex or an edge whose faces touch
+/// there may hold its edges' ends or its faces ([`touching_centre`], [`held_edge`]), and no
+/// further than healing may move geometry ([`MAX_HEAL`]); without it, as for a file that states
+/// none, nothing is held.
 fn attempt(
     raw: &mut Raw,
     start: &HashMap<usize, Point3>,
     samples: &HashMap<usize, Vec<Point3>>,
     loose: bool,
+    hold: Option<f64>,
 ) -> std::result::Result<Vec<(f64, f64)>, Vec<Failure>> {
     let ranges: Vec<Option<(f64, f64)>> = (0..raw.edges.len()).map(|e| range_of(raw, e)).collect();
     let fits: Vec<bool> = (0..raw.edges.len())
@@ -480,6 +589,10 @@ fn attempt(
     let mut failures = Vec::new();
     let mut moved = raw.points.clone();
     let mut stuck = vec![false; raw.points.len()];
+    // Vertices whose faces touch there and have no common point: each edge ends on its own faces,
+    // and the vertex's tolerance holds those ends.
+    let mut held = vec![false; raw.points.len()];
+    let hold = hold.map(|u| u.min(MAX_HEAL));
     for (v, edges) in at_vertex.iter().enumerate() {
         let p0 = start.get(&v).copied().unwrap_or(raw.points[v]);
         if edges.iter().all(|&e| fits[e]) && p0 == raw.points[v] {
@@ -504,23 +617,45 @@ fn attempt(
         );
         let p =
             solve_vertex(p0, &on, None).or_else(|| solve_vertex(p0, &on[..surfaces_only], None));
+        // Where faces touch, the point midway between their sheets, within the reach a vertex
+        // may move.
+        let centre = || {
+            let surfaces: Vec<&Surface> = faces.iter().map(|&f| &raw.faces[f].surface).collect();
+            let gap = surfaces
+                .iter()
+                .map(|s| surface_gap(s, p0))
+                .fold(0.0, f64::max);
+            let reach = (MOVE_PER_GAP * (gap + tol::LINEAR)).min(MAX_MOVE);
+            touching_centre(p0, &surfaces).filter(|&(x, _)| x.dist(p0) <= reach)
+        };
         match p {
             Some(p) => moved[v] = p,
-            None => {
-                let gap = faces
-                    .iter()
-                    .map(|&f| surface_gap(&raw.faces[f].surface, p0))
-                    .fold(0.0, f64::max);
-                stuck[v] = true;
-                failures.push(Failure::Vertex(
-                    v,
-                    format!(
-                        "the {} faces at an end of this edge have no common point near it (the \
-                         file's vertex is {gap:.1e} mm off one)",
-                        faces.len()
-                    ),
-                ));
-            }
+            None => match hold.and_then(|cap| Some((cap, centre()?))) {
+                Some((cap, (x, r))) if r <= cap => {
+                    moved[v] = x;
+                    held[v] = true;
+                }
+                c => {
+                    stuck[v] = true;
+                    // The reason is the best point's distance from the faces, not the file's
+                    // vertex's: where faces touch, the point midway between them; else the
+                    // point nearest them all that the search found.
+                    let why = match c {
+                        Some((_, (_, r))) => format!(
+                            "the {} faces at an end of this edge touch there and come no closer \
+                             than {r:.1e} mm to one point",
+                            faces.len()
+                        ),
+                        None => format!(
+                            "the {} faces at an end of this edge have no common point near it (the \
+                             nearest point found is {:.1e} mm off one)",
+                            faces.len(),
+                            nearest_meeting(p0, &on[..surfaces_only], None).1
+                        ),
+                    };
+                    failures.push(Failure::Vertex(v, why));
+                }
+            },
         }
     }
     let before = std::mem::replace(&mut raw.points, moved);
@@ -532,12 +667,15 @@ fn attempt(
         r.is_some_and(|r| {
             [(r.0, edge.start), (r.1, edge.end)].iter().all(|&(t, v)| {
                 raw.points[v] == before[v]
+                    || held[v]
                     || edge.curve.eval(t).dist(raw.points[v]) <= 0.25 * tol::LINEAR
             })
         })
     };
 
     let mut out = Vec::with_capacity(raw.edges.len());
+    let mut held_edges: HashMap<usize, f64> = HashMap::new();
+    let reach = hold.unwrap_or(tol::LINEAR);
     for (e, &old) in ranges.iter().enumerate() {
         let edge = &raw.edges[e];
         if !loose && (stuck[edge.start] || stuck[edge.end]) {
@@ -552,11 +690,39 @@ fn attempt(
             out.push(r.unwrap_or((0.0, 0.0)));
             continue;
         }
-        let rf = match samples.get(&e) {
-            Some(s) => {
-                refit(raw, e, r.or(old), Some(s)).or_else(|_| refit(raw, e, r.or(old), None))
+        // Where the faces touch along the edge, the curve midway between them is the edge; a
+        // refit could only find the same band, and fails where they lie apart.
+        let touching = match hold {
+            Some(cap) => held_edge(raw, e, r.or(old), cap),
+            None => Err(None),
+        };
+        if let Ok((curve, r, t)) = touching {
+            raw.edges[e].curve = curve;
+            out.push(r);
+            if t > tol::LINEAR {
+                held_edges.insert(e, t);
             }
-            None => refit(raw, e, r.or(old), None),
+            continue;
+        }
+        // Touching sheets further apart than half the tolerance have no point within a quarter
+        // of it of both, which is what a refit's points must be.
+        if let Err(Some(gap)) = touching
+            && gap > 0.25 * tol::LINEAR
+        {
+            failures.push(Failure::Edge(
+                e,
+                format!(
+                    "its faces touch along it and lie {:.1e} mm apart",
+                    2.0 * gap
+                ),
+            ));
+            out.push((0.0, 0.0));
+            continue;
+        }
+        let rf = match samples.get(&e) {
+            Some(s) => refit(raw, e, r.or(old), Some(s), (&held, reach))
+                .or_else(|_| refit(raw, e, r.or(old), None, (&held, reach))),
+            None => refit(raw, e, r.or(old), None, (&held, reach)),
         };
         match rf {
             Ok((curve, r)) => {
@@ -564,15 +730,110 @@ fn attempt(
                 out.push(r);
             }
             Err(why) => {
-                failures.push(Failure::Edge(e, why));
+                let held = match touching {
+                    Err(Some(gap)) => {
+                        format!(", and a curve midway between them misses them by {gap:.1e} mm")
+                    }
+                    _ => String::new(),
+                };
+                failures.push(Failure::Edge(e, format!("{why}{held}")));
                 out.push((0.0, 0.0));
             }
         }
     }
+    // A held vertex's tolerance is the widest gap between it and its edges' ends, widened as
+    // [`tolerate`] widens a gap, and no more than the file's stated uncertainty or a quarter of an
+    // edge it holds. Only a file that states one holds any.
+    let cap = hold.unwrap_or(tol::LINEAR);
+    raw.held.clear();
+    for (v, edges) in at_vertex.iter().enumerate() {
+        let widest = edges
+            .iter()
+            .filter_map(|e| held_edges.get(e))
+            .fold(0.0, |a: f64, &b| a.max(b));
+        if !held[v] && widest == 0.0 {
+            continue;
+        }
+        let x = raw.points[v];
+        let mut far: f64 = 0.0;
+        let mut shortest = f64::INFINITY;
+        for &e in edges {
+            let edge = &raw.edges[e];
+            let r = out[e];
+            if r == (0.0, 0.0) {
+                continue;
+            }
+            for (t, w) in [(r.0, edge.start), (r.1, edge.end)] {
+                if w == v {
+                    far = far.max(edge.curve.eval(t).dist(x));
+                }
+            }
+            shortest = shortest.min(edge_length(&edge.curve, r));
+        }
+        let t = if far <= tol::LINEAR {
+            tol::LINEAR
+        } else {
+            GAP_MARGIN * far
+        }
+        .max(widest);
+        if t > cap || (t > tol::LINEAR && t > MAX_SHARE * shortest) {
+            failures.push(Failure::Vertex(
+                v,
+                format!(
+                    "the faces at an end of this edge touch there, and its edges end {far:.1e} mm \
+                     apart on them"
+                ),
+            ));
+        } else if t > tol::LINEAR {
+            raw.held.insert(v, t);
+        }
+    }
+    raw.held_edges = held_edges;
     if failures.is_empty() {
         Ok(out)
     } else {
         Err(failures)
+    }
+}
+
+/// Edge `e` over `range` held with a tolerance where its two faces touch along it and no curve
+/// lies on both within the kernel tolerance: the curve [`midway`] between them through its
+/// vertices, and the widened largest gap from it to either face, if that is within `cap` and
+/// a quarter of the edge; else that gap, where the faces touch. Faces that cross are left to the
+/// surface step.
+fn held_edge(
+    raw: &Raw,
+    e: usize,
+    range: Option<(f64, f64)>,
+    cap: f64,
+) -> std::result::Result<(Curve, (f64, f64), f64), Option<f64>> {
+    let edge = &raw.edges[e];
+    let mut faces = edge.faces.clone();
+    faces.sort_unstable();
+    faces.dedup();
+    let [fa, fb] = faces.as_slice() else {
+        return Err(None);
+    };
+    let (a, b) = (&raw.faces[*fa].surface, &raw.faces[*fb].surface);
+    let r = range.or_else(|| file_range(raw, e)).ok_or(None)?;
+    let m = edge.curve.eval(0.5 * (r.0 + r.1));
+    let (ua, ub) = (a.project(m), b.project(m));
+    if a.normal(ua.x, ua.y).cross(b.normal(ub.x, ub.y)).norm() >= TOUCHING {
+        return Err(None);
+    }
+    let c = midway_by(raw, e, r, true).ok_or(None)?;
+    let dom = c.domain();
+    let gap = curve_gap(&c, dom, a).max(curve_gap(&c, dom, b));
+    let t = if gap <= tol::LINEAR {
+        tol::LINEAR
+    } else {
+        GAP_MARGIN * gap
+    };
+    let length = edge_length(&c, dom);
+    if t <= cap && (t <= tol::LINEAR || t <= MAX_SHARE * length) {
+        Ok((c, dom, t))
+    } else {
+        Err(Some(gap))
     }
 }
 
@@ -764,9 +1025,12 @@ pub(super) fn heal(raw: &mut Raw) -> Result<Ranges> {
         }
         r
     };
+    // Faces that touch are held within the file's stated uncertainty rather than moved: moving
+    // their surfaces cannot make nearly parallel sheets meet without moving them by their gap. A
+    // file that states none is healed as before.
     for round in 0..=ADJUST_ROUNDS {
         let mut work = with_surfaces(&surfaces);
-        let failures = match attempt(&mut work, &start, &samples, false) {
+        let failures = match attempt(&mut work, &start, &samples, false, file.stated) {
             Ok(ranges) => {
                 let healed = movement(&file, &work, &chosen);
                 if let Some(h) = healed.as_ref().filter(|h| h.moved > MAX_HEAL) {
@@ -804,16 +1068,7 @@ pub(super) fn heal(raw: &mut Raw) -> Result<Ranges> {
         failed_before = failures.len();
         let stuck = round > 0 && chosen.len() == before && !settled;
         if round == ADJUST_ROUNDS || stuck || worse {
-            let (id, why) = match &failures[0] {
-                Failure::Vertex(v, why) => (
-                    file.edges
-                        .iter()
-                        .find(|e| e.start == *v || e.end == *v)
-                        .map_or(0, |e| e.id),
-                    why.clone(),
-                ),
-                Failure::Edge(e, why) => (file.edges[*e].id, why.clone()),
-            };
+            let (id, why) = first_failure(&file, &failures);
             return fail(id, &why);
         }
         let mut shaped = with_surfaces(&surfaces);
@@ -833,6 +1088,20 @@ pub(super) fn heal(raw: &mut Raw) -> Result<Ranges> {
     unreachable!("the last round returns")
 }
 
+/// The STEP id an error names for the first of `failures`, and why it failed.
+fn first_failure(file: &Raw, failures: &[Failure]) -> (u64, String) {
+    match &failures[0] {
+        Failure::Vertex(v, why) => (
+            file.edges
+                .iter()
+                .find(|e| e.start == *v || e.end == *v)
+                .map_or(0, |e| e.id),
+            why.clone(),
+        ),
+        Failure::Edge(e, why) => (file.edges[*e].id, why.clone()),
+    }
+}
+
 /// Moves each vertex of `raw` onto its faces and refits each edge onto its faces wherever that
 /// works, leaving the rest as the file has it and every surface where it is, for [`tolerate`] to
 /// hold what is left: where faces meet nowhere exactly, as four faces at a corner can miss each
@@ -840,7 +1109,7 @@ pub(super) fn heal(raw: &mut Raw) -> Result<Ranges> {
 /// be further off than the file promises until it is refitted. Returns how far it moved.
 pub(super) fn heal_loosely(raw: &mut Raw) -> Option<Healed> {
     let file = raw.clone();
-    let _ = attempt(raw, &HashMap::new(), &HashMap::new(), true);
+    let _ = attempt(raw, &HashMap::new(), &HashMap::new(), true, raw.stated);
     movement(&file, raw, &BTreeSet::new())
 }
 
@@ -917,6 +1186,13 @@ fn curve_gap(c: &Curve, r: (f64, f64), s: &Surface) -> f64 {
 /// vertices as they are: where the faces lie apart along it rather than crossing, the file's curve
 /// on one of them misses the other by the whole gap, and this one by half.
 fn midway(raw: &Raw, e: usize, r: (f64, f64)) -> Option<Curve> {
+    midway_by(raw, e, r, false)
+}
+
+/// [`midway`], with each sample's feet after the first found by walking from the last ones where
+/// `walk` is set: the point moves by less each time, and a projection onto a spline from scratch
+/// searches the whole surface.
+fn midway_by(raw: &Raw, e: usize, r: (f64, f64), walk: bool) -> Option<Curve> {
     let edge = &raw.edges[e];
     let mut faces = edge.faces.clone();
     faces.sort_unstable();
@@ -941,8 +1217,15 @@ fn midway(raw: &Raw, e: usize, r: (f64, f64)) -> Option<Curve> {
             i if i == last => raw.points[edge.end],
             _ => {
                 let mut p = edge.curve.eval(t);
-                for _ in 0..50 {
-                    let (ua, ub) = (a.project(p), b.project(p));
+                let (mut ua, mut ub) = (a.project(p), b.project(p));
+                for k in 0..50 {
+                    if k > 0 {
+                        (ua, ub) = if walk {
+                            (a.project_near(p, ua), b.project_near(p, ub))
+                        } else {
+                            (a.project(p), b.project(p))
+                        };
+                    }
                     let (qa, qb) = (a.eval(ua.x, ua.y), b.eval(ub.x, ub.y));
                     let next = qa + (qb - qa) * 0.5;
                     let done = next.dist(p) <= 1e-12;
@@ -1098,4 +1381,37 @@ pub(super) fn misfit(raw: &Raw) -> Option<String> {
         return Some(format!("edge #{} lies {gap:.1e} mm off face #{f}", edge.id));
     }
     None
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::geom::Plane;
+    use crate::math::Frame;
+
+    fn plane(o: Point3, n: Vec3) -> Surface {
+        Surface::Plane(Plane {
+            frame: Frame::from_axis(o, n).unwrap(),
+        })
+    }
+
+    #[test]
+    fn touching_sheets_fix_a_point_midway_between_them_and_crossing_faces_fix_it_exactly() {
+        // Planes z = 0 and z = d (one facing down) touch; x = 0.5 crosses them. The point is
+        // midway between the sheets on the crossing plane, the least move from p0, d/2 from both.
+        let d = 1e-7;
+        let a = plane(Point3::new(0.0, 0.0, 0.0), Vec3::new(0.0, 0.0, 1.0));
+        let b = plane(Point3::new(0.0, 0.0, d), Vec3::new(0.0, 0.0, -1.0));
+        let c = plane(Point3::new(0.5, 0.0, 0.0), Vec3::new(1.0, 0.0, 0.0));
+        let p0 = Point3::new(0.5 + 3e-8, 0.2, 0.9 * d);
+        let (x, r) = touching_centre(p0, &[&a, &b, &c]).unwrap();
+        assert!(x.dist(Point3::new(0.5, 0.2, 0.5 * d)) <= 1e-15, "{x:?}");
+        assert!((r - 0.5 * d).abs() <= 1e-15, "{r}");
+        // Three crossing planes are not touching faces: the solver of crossing faces finds them.
+        let e = plane(Point3::new(0.0, 0.0, 0.0), Vec3::new(0.0, 1.0, 0.0));
+        assert!(touching_centre(p0, &[&a, &c, &e]).is_none());
+        // Four stacks overdetermine the point.
+        let f = plane(Point3::new(0.0, 0.0, 0.0), Vec3::new(1.0, 1.0, 1.0));
+        assert!(touching_centre(p0, &[&a, &b, &c, &e, &f]).is_none());
+    }
 }

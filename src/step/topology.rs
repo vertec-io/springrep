@@ -76,6 +76,8 @@ pub(super) struct Raw {
     pub held: HashMap<usize, f64>,
     /// The same for each edge whose faces touch along it and have no curve in common.
     pub held_edges: HashMap<usize, f64>,
+    /// Whether the last heal found faces that touch and lie further apart than `stated`.
+    pub beyond: bool,
 }
 
 /// The parameter of the point of `c` nearest `p`; a periodic curve's within its first period.

@@ -567,13 +567,17 @@ fn range_of(raw: &Raw, e: usize) -> Option<(f64, f64)> {
 /// `hold`, the file's stated uncertainty, is how far apart a vertex or an edge whose faces touch
 /// there may hold its edges' ends or its faces ([`touching_centre`], [`held_edge`]), and no
 /// further than healing may move geometry ([`MAX_HEAL`]); without it, as for a file that states
-/// none, nothing is held.
+/// none, nothing is held. `any` holds whatever else fails too, within the same bounds: a vertex
+/// whose faces cross and miss stays where it is, and an edge that will not refit is the curve
+/// midway between its faces. It also records in `raw.beyond` whether faces that touch lie further
+/// apart than the file states, by the bound in [`heal`].
 fn attempt(
     raw: &mut Raw,
     start: &HashMap<usize, Point3>,
     samples: &HashMap<usize, Vec<Point3>>,
     loose: bool,
     hold: Option<f64>,
+    any: bool,
 ) -> std::result::Result<Vec<(f64, f64)>, Vec<Failure>> {
     let ranges: Vec<Option<(f64, f64)>> = (0..raw.edges.len()).map(|e| range_of(raw, e)).collect();
     let fits: Vec<bool> = (0..raw.edges.len())
@@ -593,6 +597,10 @@ fn attempt(
     // and the vertex's tolerance holds those ends.
     let mut held = vec![false; raw.points.len()];
     let hold = hold.map(|u| u.min(MAX_HEAL));
+    // Whether a stack of touching sheets lies so far apart that closing it moves a surface
+    // further than the file states.
+    let stated = raw.stated.unwrap_or(f64::INFINITY);
+    let mut beyond = false;
     for (v, edges) in at_vertex.iter().enumerate() {
         let p0 = start.get(&v).copied().unwrap_or(raw.points[v]);
         if edges.iter().all(|&e| fits[e]) && p0 == raw.points[v] {
@@ -635,8 +643,13 @@ fn attempt(
                     moved[v] = x;
                     held[v] = true;
                 }
+                // Holding whatever fails, a vertex whose faces cross and miss stays where it is.
+                _ if any && hold.is_some() => held[v] = true,
                 c => {
                     stuck[v] = true;
+                    if c.is_some_and(|(_, (_, r))| r - tol::LINEAR > stated) {
+                        beyond = true;
+                    }
                     // The reason is the best point's distance from the faces, not the file's
                     // vertex's: where faces touch, the point midway between them; else the
                     // point nearest them all that the search found.
@@ -693,7 +706,7 @@ fn attempt(
         // Where the faces touch along the edge, the curve midway between them is the edge; a
         // refit could only find the same band, and fails where they lie apart.
         let touching = match hold {
-            Some(cap) => held_edge(raw, e, r.or(old), cap),
+            Some(cap) => held_edge(raw, e, r.or(old), cap, true),
             None => Err(None),
         };
         if let Ok((curve, r, t)) = touching {
@@ -709,6 +722,9 @@ fn attempt(
         if let Err(Some(gap)) = touching
             && gap > 0.25 * tol::LINEAR
         {
+            if gap - tol::LINEAR > stated {
+                beyond = true;
+            }
             failures.push(Failure::Edge(
                 e,
                 format!(
@@ -728,6 +744,17 @@ fn attempt(
             Ok((curve, r)) => {
                 raw.edges[e].curve = curve;
                 out.push(r);
+            }
+            Err(_)
+                if any
+                    && let Some(cap) = hold
+                    && let Ok((curve, r, t)) = held_edge(raw, e, r.or(old), cap, false) =>
+            {
+                raw.edges[e].curve = curve;
+                out.push(r);
+                if t > tol::LINEAR {
+                    held_edges.insert(e, t);
+                }
             }
             Err(why) => {
                 let held = match touching {
@@ -789,6 +816,7 @@ fn attempt(
         }
     }
     raw.held_edges = held_edges;
+    raw.beyond = beyond;
     if failures.is_empty() {
         Ok(out)
     } else {
@@ -799,13 +827,14 @@ fn attempt(
 /// Edge `e` over `range` held with a tolerance where its two faces touch along it and no curve
 /// lies on both within the kernel tolerance: the curve [`midway`] between them through its
 /// vertices, and the widened largest gap from it to either face, if that is within `cap` and
-/// a quarter of the edge; else that gap, where the faces touch. Faces that cross are left to the
-/// surface step.
+/// a quarter of the edge; else that gap, where the faces touch. With `touching_only`, faces that
+/// cross are left to the surface step.
 fn held_edge(
     raw: &Raw,
     e: usize,
     range: Option<(f64, f64)>,
     cap: f64,
+    touching_only: bool,
 ) -> std::result::Result<(Curve, (f64, f64), f64), Option<f64>> {
     let edge = &raw.edges[e];
     let mut faces = edge.faces.clone();
@@ -818,7 +847,7 @@ fn held_edge(
     let r = range.or_else(|| file_range(raw, e)).ok_or(None)?;
     let m = edge.curve.eval(0.5 * (r.0 + r.1));
     let (ua, ub) = (a.project(m), b.project(m));
-    if a.normal(ua.x, ua.y).cross(b.normal(ub.x, ub.y)).norm() >= TOUCHING {
+    if touching_only && a.normal(ua.x, ua.y).cross(b.normal(ub.x, ub.y)).norm() >= TOUCHING {
         return Err(None);
     }
     let c = midway_by(raw, e, r, true).ok_or(None)?;
@@ -1030,7 +1059,7 @@ pub(super) fn heal(raw: &mut Raw) -> Result<Ranges> {
     // file that states none is healed as before.
     for round in 0..=ADJUST_ROUNDS {
         let mut work = with_surfaces(&surfaces);
-        let failures = match attempt(&mut work, &start, &samples, false, file.stated) {
+        let failures = match attempt(&mut work, &start, &samples, false, file.stated, false) {
             Ok(ranges) => {
                 let healed = movement(&file, &work, &chosen);
                 if let Some(h) = healed.as_ref().filter(|h| h.moved > MAX_HEAL) {
@@ -1047,6 +1076,19 @@ pub(super) fn heal(raw: &mut Raw) -> Result<Ranges> {
             }
             Err(f) => f,
         };
+        // Two touching sheets s apart where they come nearest, their normals along the chord
+        // between their feet, have no point within the tolerance of both unless one surface moves
+        // by at least (s − 2·LINEAR)/2, half the gap left to close. On the file's own surfaces,
+        // where that exceeds the uncertainty the file states, a heal that moved a surface so far
+        // would be discarded for the file's geometry ([`super::topology`]), so healing stops at
+        // the first attempt. It is a bound on the geometry, the same on any machine.
+        if round == 0 && work.beyond {
+            let (id, why) = first_failure(&file, &failures);
+            return fail(
+                id,
+                &format!("{why}, further apart than the file's uncertainty"),
+            );
+        }
         let before = chosen.len();
         for f in &failures {
             match f {
@@ -1068,6 +1110,17 @@ pub(super) fn heal(raw: &mut Raw) -> Result<Ranges> {
         failed_before = failures.len();
         let stuck = round > 0 && chosen.len() == before && !settled;
         if round == ADJUST_ROUNDS || stuck || worse {
+            // Where moving surfaces did not close the solid, the file's surfaces stay, everything
+            // that fits is healed, and what still fails is held within the file's uncertainty.
+            if file.stated.is_some() {
+                let mut held = file.clone();
+                let (none, no) = (HashMap::new(), HashMap::new());
+                if let Ok(ranges) = attempt(&mut held, &none, &no, false, file.stated, true) {
+                    let healed = movement(&file, &held, &BTreeSet::new());
+                    *raw = held;
+                    return Ok((ranges, healed));
+                }
+            }
             let (id, why) = first_failure(&file, &failures);
             return fail(id, &why);
         }
@@ -1109,7 +1162,14 @@ fn first_failure(file: &Raw, failures: &[Failure]) -> (u64, String) {
 /// be further off than the file promises until it is refitted. Returns how far it moved.
 pub(super) fn heal_loosely(raw: &mut Raw) -> Option<Healed> {
     let file = raw.clone();
-    let _ = attempt(raw, &HashMap::new(), &HashMap::new(), true, raw.stated);
+    let _ = attempt(
+        raw,
+        &HashMap::new(),
+        &HashMap::new(),
+        true,
+        raw.stated,
+        false,
+    );
     movement(&file, raw, &BTreeSet::new())
 }
 

@@ -2237,6 +2237,12 @@ solid never pinches.
      the step starts again with knots inserted until each parameter has 16 spans; the points it
      placed along an edge that would not fit seed that edge's refit, since two touching faces meet
      anywhere across a band. Step 1 then runs again on the moved surfaces, up to three times.
+     Two touching sheets s apart where they come nearest have no point within `LINEAR` of both
+     unless a surface moves by at least (s − 2·`LINEAR`)/2; where the first attempt finds a stack
+     that far apart beyond the file's stated uncertainty, healing stops there, since a heal moving
+     the file's geometry so far would be set aside for step 4. Where the rounds end without closing
+     the solid, one more attempt on the file's own surfaces heals what fits and holds what still
+     fails within the stated uncertainty, as step 1 holds touching faces, before step 4.
   3. Every solid records how far its geometry moved: the largest distance any vertex, edge or
      surface moved, what moved and where, and the largest surface movement on its own, which bounds
      how far a face moved. `Import::healed` carries it for each placed solid, for the caller to

@@ -4953,8 +4953,10 @@ fn touching_faces_in_a_file_that_states_no_uncertainty_are_closed_by_moving_a_su
 }
 
 /// Grown 5e-6 in a file that states 1e-6, the round's corners are 2.5e-6 from the sheets they
-/// would be held between, more than the file says its geometry is off, so nothing is held, and
-/// the file's geometry is kept with tolerances of 1.5 times the 5e-6 gap, as before.
+/// would be held between, more than the file says its geometry is off, so nothing is held. Any
+/// point within the tolerance of both sheets needs a surface moved (5e-6 − 2e-7)/2 = 2.4e-6, more
+/// than 1e-6, so healing stops at its first attempt, and the file's geometry is kept with
+/// tolerances of 1.5 times the 5e-6 gap, as before.
 #[test]
 fn touching_faces_further_apart_than_the_file_states_are_kept_as_it_has_them() {
     let imp = rounds_grown(5e-6, Some(1e-6));

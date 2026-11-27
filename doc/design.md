@@ -2218,7 +2218,9 @@ solid never pinches.
      moves to the least move from the file's that meets the middle of each stack of touching sheets
      (the minimum-norm solution of at most three equations), each of its edges ends on its own two
      faces as near it as they meet, and an edge along touching faces is the curve midway between
-     them. Each carries 1.5 times its widest gap, within the stated uncertainty, `MAX_HEAL` and a
+     them: the file's line or circle through a point midway where both faces are carried onto
+     themselves along it (parallel planes, a round against its wall, coaxial sheets at a circle),
+     else a B-spline through points midway. Each carries 1.5 times its widest gap, within the stated uncertainty, `MAX_HEAL` and a
      quarter of its shortest edge; the surfaces stay as the file has them. A hold is kept only where
      the vertex, its edges' ends and the curves it gave them stay within those bounds of where the
      file has them, since an edge at it whose faces cross ends on the far sheet; a hold that fails

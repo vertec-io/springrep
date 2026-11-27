@@ -17,8 +17,8 @@ use super::adjust::{Target, adjust};
 use super::topology::{Raw, edge_range, param_of};
 use crate::{
     Error, Result,
-    geom::{BSpline, Curve, IntersectionCurve, Surface, refine_onto_both},
-    math::{Point3, Vec2, Vec3},
+    geom::{BSpline, Circle, Curve, IntersectionCurve, Line, Surface, refine_onto_both},
+    math::{Frame, Point3, Vec2, Vec3},
     numeric::solve_dense,
     tol,
 };
@@ -1022,8 +1022,7 @@ fn held_edge(
     if a.normal(ua.x, ua.y).cross(b.normal(ub.x, ub.y)).norm() >= TOUCHING {
         return Err(None);
     }
-    let c = midway_by(raw, e, r, Some(2.0 * cap)).ok_or(None)?;
-    let dom = c.domain();
+    let (c, dom) = midway_by(raw, e, r, Some(2.0 * cap)).ok_or(None)?;
     let gap = curve_gap(&c, dom, a).max(curve_gap(&c, dom, b));
     let t = if gap <= tol::LINEAR {
         tol::LINEAR
@@ -1437,7 +1436,7 @@ fn curve_gap(c: &Curve, r: (f64, f64), s: &Surface) -> f64 {
 /// A curve for edge `e` over its file range `r` halfway between its two faces, through its
 /// vertices as they are: where the faces lie apart along it rather than crossing, the file's curve
 /// on one of them misses the other by the whole gap, and this one by half.
-fn midway(raw: &Raw, e: usize, r: (f64, f64)) -> Option<Curve> {
+fn midway(raw: &Raw, e: usize, r: (f64, f64)) -> Option<(Curve, (f64, f64))> {
     midway_by(raw, e, r, None)
 }
 
@@ -1446,7 +1445,11 @@ fn midway(raw: &Raw, e: usize, r: (f64, f64)) -> Option<Curve> {
 /// little each time and a projection onto a spline from scratch searches the whole surface. A
 /// walk that ends further than `walk` from a sample's point, where no edge held within it lies, is
 /// done again from scratch.
-fn midway_by(raw: &Raw, e: usize, r: (f64, f64), walk: Option<f64>) -> Option<Curve> {
+///
+/// Returns the curve with its range. Where both faces are carried onto themselves along the edge,
+/// it is the file's line or circle through a point midway ([`symmetric_midway`]); else a B-spline
+/// through points midway.
+fn midway_by(raw: &Raw, e: usize, r: (f64, f64), walk: Option<f64>) -> Option<(Curve, (f64, f64))> {
     let edge = &raw.edges[e];
     let mut faces = edge.faces.clone();
     faces.sort_unstable();
@@ -1509,13 +1512,93 @@ fn midway_by(raw: &Raw, e: usize, r: (f64, f64), walk: Option<f64>) -> Option<Cu
             }
         })
         .collect();
+    let ends = (raw.points[edge.start], raw.points[edge.end]);
+    if let Some(c) = symmetric_midway(a, b, &edge.curve, &pts)
+        && let Some(r) = edge_range(&c, ends.0, ends.1, closed)
+    {
+        return Some((c, r));
+    }
     let spline = if closed {
         pts.pop();
         BSpline::interpolate_periodic(&pts)
     } else {
         BSpline::interpolate(&pts)
     };
-    spline.ok().map(Curve::BSpline)
+    let c = Curve::BSpline(spline.ok()?);
+    let r = c.domain();
+    Some((c, r))
+}
+
+/// How far a surface may be from carried onto itself, as a sine or in mm, for [`symmetric_midway`]
+/// to take it as carried exactly; the curve it gives is kept only where it holds every point
+/// midway as well.
+const SYMMETRIC: f64 = 1e-12;
+
+/// The curve midway between surfaces `a` and `b` along `c`, a line or a circle, where both
+/// surfaces are carried onto themselves by every translation along the line or every rotation
+/// about the circle's axis: that motion, an isometry, carries a point's feet on them to the feet
+/// of the moved point, and so a point midway to points midway, and the curve midway is the line or
+/// circle through one of them, `points[mid]`. A plane, or a cylinder whose axis lies along the
+/// line, is carried along it, which covers parallel planes, a round against a wall and rounds side
+/// by side; a plane square to the axis, or a cylinder, cone, sphere or torus about it, is carried
+/// round it, which covers coaxial sheets at a circle. The curve keeps `c`'s direction, or its
+/// circle's frame, and is kept only where every one of `points`, the edge's ends among them, lies
+/// within a thousandth of the tolerance of it; else `None`, for the B-spline through them.
+fn symmetric_midway(a: &Surface, b: &Surface, c: &Curve, points: &[Point3]) -> Option<Curve> {
+    if points.len() < 3 {
+        return None;
+    }
+    let p = points[points.len() / 2];
+    let parallel = |u: Vec3, v: Vec3| u.cross(v).norm() <= SYMMETRIC * u.norm() * v.norm();
+    let curve = match c {
+        Curve::Line(l) => {
+            let along = |s: &Surface| match s {
+                Surface::Plane(pl) => pl.frame.z.dot(l.dir).abs() <= SYMMETRIC * l.dir.norm(),
+                Surface::Cylinder(cy) => parallel(cy.frame.z, l.dir),
+                _ => false,
+            };
+            if !(along(a) && along(b)) {
+                return None;
+            }
+            Curve::Line(Line {
+                origin: p,
+                dir: l.dir,
+            })
+        }
+        Curve::Circle(ci) => {
+            let (o, z) = (ci.frame.origin, ci.frame.z);
+            let on_axis =
+                |f: &Frame| parallel(f.z, z) && (f.origin - o).cross(z).norm() <= SYMMETRIC;
+            let round = |s: &Surface| match s {
+                Surface::Plane(pl) => parallel(pl.frame.z, z),
+                Surface::Cylinder(x) => on_axis(&x.frame),
+                Surface::Cone(x) => on_axis(&x.frame),
+                Surface::Torus(x) => on_axis(&x.frame),
+                Surface::Sphere(x) => (x.frame.origin - o).cross(z).norm() <= SYMMETRIC,
+                _ => false,
+            };
+            if !(round(a) && round(b)) {
+                return None;
+            }
+            let centre = o + z * (p - o).dot(z);
+            let radius = p.dist(centre);
+            if radius <= tol::LINEAR {
+                return None;
+            }
+            Curve::Circle(Circle {
+                frame: Frame {
+                    origin: centre,
+                    ..ci.frame
+                },
+                radius,
+            })
+        }
+        _ => return None,
+    };
+    points
+        .iter()
+        .all(|&q| curve.eval(param_of(&curve, q)).dist(q) <= 1e-3 * tol::LINEAR)
+        .then_some(curve)
 }
 
 /// The share of an edge's length that its tolerance, or that of a vertex it ends at, may reach:
@@ -1570,9 +1653,9 @@ pub(super) fn tolerate(
         };
         let mut gap = gap_of(&raw.edges[e].curve, r);
         if gap > stated.unwrap_or(tol::LINEAR)
-            && let Some(c) = midway(raw, e, r)
+            && let Some((c, rm)) = midway(raw, e, r)
         {
-            let (rm, gm) = (c.domain(), gap_of(&c, c.domain()));
+            let gm = gap_of(&c, rm);
             if gm < gap {
                 (r, gap) = (rm, gm);
                 raw.edges[e].curve = c;
@@ -1658,7 +1741,6 @@ pub(super) fn misfit(raw: &Raw) -> Option<String> {
 mod tests {
     use super::*;
     use crate::geom::Plane;
-    use crate::math::Frame;
 
     fn plane(o: Point3, n: Vec3) -> Surface {
         Surface::Plane(Plane {
@@ -1711,5 +1793,81 @@ mod tests {
             "the faces at an end of this edge touch there, and its edges end 2.0e-3 mm apart on \
              them, which needs a tolerance of 3.0e-3 mm, more than the 1.0e-3 mm a hold may"
         );
+    }
+    #[test]
+    fn faces_carried_onto_themselves_along_an_edge_hold_it_midway_on_its_line_or_circle() {
+        use crate::geom::Cylinder;
+        let g = 1e-4;
+        let cyl = |r: f64, z: Vec3| {
+            Surface::Cylinder(Cylinder {
+                frame: Frame::from_axis(Point3::new(0.0, 0.0, 0.0), z).unwrap(),
+                radius: r,
+            })
+        };
+        let along = |o: Point3| {
+            let pts: Vec<Point3> = (0..5).map(|k| o + Vec3::new(k as f64, 0.0, 0.0)).collect();
+            pts
+        };
+        let x = Curve::Line(Line {
+            origin: Point3::new(0.0, 1.0, 0.0),
+            dir: Vec3::new(1.0, 0.0, 0.0),
+        });
+        let line_at = |c: Option<Curve>| match c {
+            Some(Curve::Line(l)) => (l.origin, l.dir),
+            c => panic!("{c:?}"),
+        };
+        // Parallel planes y = 1 and y = 1 + g: the line midway, y = 1 + g/2.
+        let (a, b) = (
+            plane(Point3::new(0.0, 1.0, 0.0), Vec3::new(0.0, 1.0, 0.0)),
+            plane(Point3::new(0.0, 1.0 + g, 0.0), Vec3::new(0.0, -1.0, 0.0)),
+        );
+        let mid = Point3::new(0.0, 1.0 + 0.5 * g, 0.0);
+        let (o, d) = line_at(symmetric_midway(&a, &b, &x, &along(mid)));
+        assert_eq!(
+            (o, d),
+            (
+                Point3::new(2.0, 1.0 + 0.5 * g, 0.0),
+                Vec3::new(1.0, 0.0, 0.0)
+            )
+        );
+        // A round of radius 1 along x against the wall y = 1 + g it is tangent to: the same line.
+        let round = cyl(1.0, Vec3::new(1.0, 0.0, 0.0));
+        let (o, _) = line_at(symmetric_midway(&round, &b, &x, &along(mid)));
+        assert_eq!(o, Point3::new(2.0, 1.0 + 0.5 * g, 0.0));
+        // Points off the line, as where a vertex is held elsewhere, keep the B-spline.
+        let mut off = along(mid);
+        off[4].z += 1e-6;
+        assert!(symmetric_midway(&round, &b, &x, &off).is_none());
+        // A wall that tilts along the edge is not carried along it.
+        let tilted = plane(Point3::new(0.0, 1.0 + g, 0.0), Vec3::new(1e-3, -1.0, 0.0));
+        assert!(symmetric_midway(&round, &tilted, &x, &along(mid)).is_none());
+        // Coaxial cylinders of radii 1 and 1 + g about z, at a circle about z: the circle of
+        // radius 1 + g/2, in the file's circle's frame.
+        let frame = Frame::from_axis(Point3::new(0.0, 0.0, 2.0), Vec3::new(0.0, 0.0, 1.0)).unwrap();
+        let c = Curve::Circle(Circle { frame, radius: 1.0 });
+        let r = 1.0 + 0.5 * g;
+        let pts: Vec<Point3> = (0..5)
+            .map(|k| {
+                let t = k as f64;
+                Point3::new(r * t.cos(), r * t.sin(), 2.0)
+            })
+            .collect();
+        let (z, z2) = (
+            cyl(1.0, Vec3::new(0.0, 0.0, 1.0)),
+            cyl(1.0 + g, Vec3::new(0.0, 0.0, 1.0)),
+        );
+        match symmetric_midway(&z, &z2, &c, &pts) {
+            Some(Curve::Circle(ci)) => {
+                assert!((ci.radius - r).abs() <= 1e-15, "{ci:?}");
+                assert_eq!((ci.frame.origin, ci.frame.z), (frame.origin, frame.z));
+            }
+            c => panic!("{c:?}"),
+        }
+        // Cylinders whose axes are parallel but apart are not carried round a circle.
+        let apart = Surface::Cylinder(Cylinder {
+            frame: Frame::from_axis(Point3::new(1e-3, 0.0, 0.0), Vec3::new(0.0, 0.0, 1.0)).unwrap(),
+            radius: 1.0 + g,
+        });
+        assert!(symmetric_midway(&z, &apart, &c, &pts).is_none());
     }
 }

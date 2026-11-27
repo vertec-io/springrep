@@ -5983,6 +5983,24 @@ fn touching_faces_within_the_files_uncertainty_are_held_rather_than_moved() {
             );
             assert!((t.largest - 0.75 * dr).abs() <= 1e-13, "{dr}: {t:?}");
         }
+        // The round is carried onto itself along its lines, as the sides are: each held line is
+        // the line midway, not a B-spline.
+        let held: Vec<_> = imp
+            .brep
+            .edge_ids()
+            .filter(|&e| imp.brep.edge_tolerance(e) > crate::tol::LINEAR)
+            .map(|e| imp.brep.edge(e).curve.clone())
+            .collect();
+        let lines = if 0.75 * dr <= crate::tol::LINEAR {
+            0
+        } else {
+            2
+        };
+        assert_eq!(held.len(), lines, "{dr}: {held:?}");
+        assert!(
+            held.iter().all(|c| matches!(c, Some(Curve::Line(_)))),
+            "{dr}: {held:?}"
+        );
         let v = measure::volume(&imp.brep);
         assert!((v - v0).abs() <= a * dr, "{dr}: {v} vs {v0}");
     }
